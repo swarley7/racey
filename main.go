@@ -1,19 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
+	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
-
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
@@ -43,59 +46,58 @@ Ensure TCP_NODELAY is disabled - it's crucial that Nagle's algorithm batches the
 Send a ping packet to warm the local connection. If you don't do this, the OS network stack will place the first final-frame in a separate packet.
 */
 
-func client() {
-	delay := time.Duration(100 * time.Millisecond)
-	client := &http.Client{}
-	client.Transport = &http2.Transport{
-		AllowHTTP: true,
-		DialTLS: func(netw, addr string, cfg *tls.Config) (net.Conn, error) {
-			cfg.InsecureSkipVerify = true
-			tcpAddr, _ := net.ResolveTCPAddr("tcp4", addr)
-			conn, err := net.DialTCP(netw, nil, tcpAddr)
-			if err != nil {
-				log.Println(err)
-				return nil, err
-			}
-			conn.SetNoDelay(false) // Enable Nagle's algorithm to batch final frames
-			return conn, err
-		}}
-	wg := sync.WaitGroup{}
-	reqsChan := make(chan request)
-	proceed := make(chan struct{}, 1)
-	go gateRequests(wg, client, reqsChan, proceed)
-	requests := []string{"https://www.google.com/"}
-	for _, req := range requests {
-		parsed, err := url.ParseRequestURI(req)
-		if err != nil {
-			panic(err)
-		}
-		address := parsed.Hostname()
-		err = ping(address)
-		if err != nil {
-			log.Println(err)
-		}
-		r, err := http.NewRequest("GET", req, nil)
-		if err != nil {
-			panic(err)
-		}
-		resp, err := client.Do(r)
-		if err != nil {
-			panic(err)
-		}
-		log.Println(resp)
-		reqsChan <- request{Host: req, Request: r}
+// func client() {
+// 	client := &http.Client{}
+// 	client.Transport = &http2.Transport{
+// 		AllowHTTP: true,
+// 		DialTLS: func(netw, addr string, cfg *tls.Config) (net.Conn, error) {
+// 			cfg.InsecureSkipVerify = true
+// 			tcpAddr, _ := net.ResolveTCPAddr("tcp4", addr)
+// 			conn, err := net.DialTCP(netw, nil, tcpAddr)
+// 			if err != nil {
+// 				log.Println(err)
+// 				return nil, err
+// 			}
+// 			conn.SetNoDelay(false) // Enable Nagle's algorithm to batch final frames
+// 			return conn, err
+// 		}}
+// 	wg := sync.WaitGroup{}
+// 	reqsChan := make(chan request)
+// 	proceed := make(chan struct{}, 1)
+// 	go gateRequests(wg, client, reqsChan, proceed)
+// 	requests := []string{"https://www.google.com/"}
+// 	for _, req := range requests {
+// 		parsed, err := url.ParseRequestURI(req)
+// 		if err != nil {
+// 			panic(err)
+// 		}
+// 		address := parsed.Hostname()
+// 		err = ping(address)
+// 		if err != nil {
+// 			log.Println(err)
+// 		}
+// 		r, err := http.NewRequest("GET", req, nil)
+// 		if err != nil {
+// 			panic(err)
+// 		}
+// 		resp, err := client.Do(r)
+// 		if err != nil {
+// 			panic(err)
+// 		}
+// 		log.Println(resp)
+// 		reqsChan <- request{Host: req, Request: r}
 
-	}
-	doDelay(delay)
-	// Ping the host
-	err := ping("www.google.com") // Could change this to HTTP2 ping?
-	if err != nil {
-		panic(err)
-	}
-	wg.Add(1)
-	proceed <- struct{}{}
-	wg.Wait()
-}
+// 	}
+// 	doDelay(delay)
+// 	// Ping the host
+// 	err := ping("www.google.com") // Could change this to HTTP2 ping?
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	wg.Add(1)
+// 	proceed <- struct{}{}
+// 	wg.Wait()
+// }
 
 func gateRequests(wg sync.WaitGroup, client *http.Client, reqs chan request, proceed chan struct{}) {
 	// Wait for everything to be ready
@@ -141,14 +143,42 @@ func ping(address string) (err error) {
 }
 
 func main() {
-	host := "www.example.com:443"
-	app := &request{Host: host}
+	var Url, headers, requestFile, method string
+	var count int
+	var delay int64
+	var debug bool
+	flag.StringVar(&Url, "url", "https://localhost:8000", "Target URL")
+	flag.StringVar(&method, "method", "GET", "HTTP Method")
+
+	flag.StringVar(&headers, "headers", "", "HTTP headers to include (copy paste from Burp)")
+	flag.StringVar(&requestFile, "request", "", "A file containing a HTTP request to load")
+	flag.IntVar(&count, "count", 1, "Number of requests to send")
+	flag.Int64Var(&delay, "delay", 100, "Delay before sending final frames")
+	flag.BoolVar(&debug, "debug", false, "Enable http2 debugging, log TLS keys for interception")
+
+	flag.Parse()
+
+	parsed, err := url.ParseRequestURI(Url)
+	if err != nil {
+		panic(err)
+	}
+	if !strings.Contains(parsed.Host, ":") {
+		parsed.Host += ":443" //add port
+	}
+	app := &request{Host: parsed.Host, peerSetting: make(map[http2.SettingID]uint32)}
 	app.henc = hpack.NewEncoder(&app.hbuf)
 
 	cfg := &tls.Config{
 		ServerName:         app.Host,
 		NextProtos:         strings.Split("h2,h2-14", ","),
 		InsecureSkipVerify: true,
+	}
+	if debug {
+		f, err := os.OpenFile("/tmp/keys", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			panic(err)
+		}
+		cfg.KeyLogWriter = f
 	}
 	hostAndPort := app.Host
 	log.Printf("Connecting to %s ...", hostAndPort)
@@ -168,16 +198,160 @@ func main() {
 	}
 	state := tc.ConnectionState()
 	log.Printf("Negotiated protocol %q", state.NegotiatedProtocol)
-	if !state.NegotiatedProtocolIsMutual || state.NegotiatedProtocol == "" {
+	if state.NegotiatedProtocol == "" {
 		log.Fatalf("Could not negotiate protocol mutually")
 	}
 	if _, err := io.WriteString(tc, http2.ClientPreface); err != nil {
 		log.Fatalf("err %v", err)
 	}
 	app.framer = http2.NewFramer(tc, tc)
+	// testing
 
+	//Wrap this shit in a method and loop
+	/* here*/
+	req, err := http.NewRequest(method, parsed.String(), nil)
+	if err != nil {
+		log.Fatalf("err %v", err)
+	}
+
+	hbf := app.encodeHeaders(req)
+	for i := 1; i <= count*2; i += 2 {
+		app.streamID = uint32(i)
+		// log.Println(hbf)
+		log.Printf("Opening Stream-ID %d:\n", app.streamID)
+		var settings []http2.Setting
+		app.framer.WriteSettings(settings...)
+		app.framer.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      app.streamID,
+			BlockFragment: hbf,
+			EndStream:     false, // good enough for now
+			EndHeaders:    true,  // for now
+		})
+
+	}
+	log.Printf("Sent initial frames, waiting")
+
+	doDelay(time.Duration(delay) * time.Millisecond)
+	var data [8]byte
+
+	copy(data[:], "lol_ping")
+	log.Printf("Pinging host: %v", parsed.Host)
+	ping(parsed.Hostname())
+	for i := 1; i <= count*2; i += 2 {
+		app.streamID = uint32(i)
+		app.framer.WriteData(app.streamID, true, []byte{})
+	}
+	// time.Sleep(1000 * time.Millisecond)
+	errc := make(chan error)
+	go func() { errc <- app.readFrames() }()
+	<-errc
+
+	/* here */
 }
 
-func (a *request) ReadRequest(args []string) (err error) {
+func (a *request) ReadRequest(filename string) (err error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		log.Printf("Error: %v\n", err)
+		return err
+	}
+	rawReq := bufio.NewReader(f)
+	a.Request, err = http.ReadRequest(rawReq)
+	if err != nil {
+		log.Printf("Error: %v\n", err)
+		return err
+	}
 	return err
+}
+
+func (app *request) encodeHeaders(req *http.Request) []byte {
+	app.hbuf.Reset()
+
+	host := req.Host
+	if host == "" {
+		host = req.URL.Host
+	}
+
+	path := req.URL.Path
+	if path == "" {
+		path = "/"
+	}
+
+	app.writeHeader(":authority", host)
+	app.writeHeader(":method", req.Method)
+	app.writeHeader(":path", path)
+	app.writeHeader(":scheme", "https")
+
+	for k, vv := range req.Header {
+		lowKey := strings.ToLower(k)
+		if lowKey == "host" {
+			continue
+		}
+		for _, v := range vv {
+			app.writeHeader(lowKey, v)
+		}
+	}
+	return app.hbuf.Bytes()
+}
+
+func (app *request) writeHeader(name, value string) {
+	app.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
+}
+
+func (app *request) logf(format string, args ...interface{}) {
+	log.Printf(format+"\r\n", args...)
+}
+
+func (app *request) readFrames() error {
+	for {
+		f, err := app.framer.ReadFrame()
+		if err != nil {
+			return fmt.Errorf("ReadFrame: %v", err)
+		}
+		app.logf("%v", f)
+		switch f := f.(type) {
+		case *http2.PingFrame:
+			app.logf("  Data = %q", f.Data)
+		case *http2.SettingsFrame:
+			f.ForeachSetting(func(s http2.Setting) error {
+				app.logf("  %v", s)
+				app.peerSetting[s.ID] = s.Val
+				return nil
+			})
+		case *http2.WindowUpdateFrame:
+			app.logf("  Window-Increment = %v", f.Increment)
+		case *http2.GoAwayFrame:
+			app.logf("  Last-Stream-ID = %d; Error-Code = %v (%d)", f.LastStreamID, f.ErrCode, f.ErrCode)
+		case *http2.DataFrame:
+			app.logf("  %q", f.Data())
+		case *http2.HeadersFrame:
+			if f.HasPriority() {
+				app.logf("  PRIORITY = %v", f.Priority)
+			}
+			if app.hdec == nil {
+				// TODO: if the user uses h2i to send a SETTINGS frame advertising
+				// something larger, we'll need to respect SETTINGS_HEADER_TABLE_SIZE
+				// and stuff here instead of using the 4k default. But for now:
+				tableSize := uint32(4 << 10)
+				app.hdec = hpack.NewDecoder(tableSize, app.onNewHeaderField)
+			}
+			app.hdec.Write(f.HeaderBlockFragment())
+		case *http2.PushPromiseFrame:
+			if app.hdec == nil {
+				// TODO: if the user uses h2i to send a SETTINGS frame advertising
+				// something larger, we'll need to respect SETTINGS_HEADER_TABLE_SIZE
+				// and stuff here instead of using the 4k default. But for now:
+				tableSize := uint32(4 << 10)
+				app.hdec = hpack.NewDecoder(tableSize, app.onNewHeaderField)
+			}
+			app.hdec.Write(f.HeaderBlockFragment())
+		}
+	}
+}
+
+func (app *request) onNewHeaderField(f hpack.HeaderField) {
+	if f.Sensitive {
+		app.logf("  %s = %q (SENSITIVE)", f.Name, f.Value)
+	}
+	app.logf("  %s = %q", f.Name, f.Value)
 }
