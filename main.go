@@ -46,59 +46,6 @@ Ensure TCP_NODELAY is disabled - it's crucial that Nagle's algorithm batches the
 Send a ping packet to warm the local connection. If you don't do this, the OS network stack will place the first final-frame in a separate packet.
 */
 
-// func client() {
-// 	client := &http.Client{}
-// 	client.Transport = &http2.Transport{
-// 		AllowHTTP: true,
-// 		DialTLS: func(netw, addr string, cfg *tls.Config) (net.Conn, error) {
-// 			cfg.InsecureSkipVerify = true
-// 			tcpAddr, _ := net.ResolveTCPAddr("tcp4", addr)
-// 			conn, err := net.DialTCP(netw, nil, tcpAddr)
-// 			if err != nil {
-// 				log.Println(err)
-// 				return nil, err
-// 			}
-// 			conn.SetNoDelay(false) // Enable Nagle's algorithm to batch final frames
-// 			return conn, err
-// 		}}
-// 	wg := sync.WaitGroup{}
-// 	reqsChan := make(chan request)
-// 	proceed := make(chan struct{}, 1)
-// 	go gateRequests(wg, client, reqsChan, proceed)
-// 	requests := []string{"https://www.google.com/"}
-// 	for _, req := range requests {
-// 		parsed, err := url.ParseRequestURI(req)
-// 		if err != nil {
-// 			panic(err)
-// 		}
-// 		address := parsed.Hostname()
-// 		err = ping(address)
-// 		if err != nil {
-// 			log.Println(err)
-// 		}
-// 		r, err := http.NewRequest("GET", req, nil)
-// 		if err != nil {
-// 			panic(err)
-// 		}
-// 		resp, err := client.Do(r)
-// 		if err != nil {
-// 			panic(err)
-// 		}
-// 		log.Println(resp)
-// 		reqsChan <- request{Host: req, Request: r}
-
-// 	}
-// 	doDelay(delay)
-// 	// Ping the host
-// 	err := ping("www.google.com") // Could change this to HTTP2 ping?
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	wg.Add(1)
-// 	proceed <- struct{}{}
-// 	wg.Wait()
-// }
-
 func gateRequests(wg sync.WaitGroup, client *http.Client, reqs chan request, proceed chan struct{}) {
 	// Wait for everything to be ready
 	gatedReqs := make(chan request)
@@ -142,6 +89,10 @@ func ping(address string) (err error) {
 	return err
 }
 
+func init() {
+
+}
+
 func main() {
 	var Url, headers, requestFile, method string
 	var count int
@@ -153,12 +104,25 @@ func main() {
 	flag.StringVar(&headers, "headers", "", "HTTP headers to include (copy paste from Burp)")
 	flag.StringVar(&requestFile, "request", "", "A file containing a HTTP request to load")
 	flag.IntVar(&count, "count", 1, "Number of requests to send")
-	flag.Int64Var(&delay, "delay", 100, "Delay before sending final frames")
+	flag.Int64Var(&delay, "delay", 1000, "Delay before sending final frames")
 	flag.BoolVar(&debug, "debug", false, "Enable http2 debugging, log TLS keys for interception")
 
 	flag.Parse()
 
-	parsed, err := url.ParseRequestURI(Url)
+	//Wrap this in a method and loop
+	/* here*/
+	var err error
+	var req *http.Request
+	if requestFile != "" {
+		req, err = ReadRequest(requestFile)
+	} else {
+		req, err = http.NewRequest(method, Url, nil)
+	}
+	if err != nil {
+		log.Fatalf("err %v", err)
+	}
+
+	parsed, err := url.ParseRequestURI(req.URL.Host)
 	if err != nil {
 		panic(err)
 	}
@@ -207,19 +171,12 @@ func main() {
 	app.framer = http2.NewFramer(tc, tc)
 	// testing
 
-	//Wrap this shit in a method and loop
-	/* here*/
-	req, err := http.NewRequest(method, parsed.String(), nil)
-	if err != nil {
-		log.Fatalf("err %v", err)
-	}
-
 	hbf := app.encodeHeaders(req)
 	for i := 1; i <= count*2; i += 2 {
 		app.streamID = uint32(i)
 		// log.Println(hbf)
 		log.Printf("Opening Stream-ID %d:\n", app.streamID)
-		var settings []http2.Setting
+		var settings []http2.Setting // TODO figure out if there's any benefit to modifying settings?
 		app.framer.WriteSettings(settings...)
 		app.framer.WriteHeaders(http2.HeadersFrameParam{
 			StreamID:      app.streamID,
@@ -232,9 +189,9 @@ func main() {
 	log.Printf("Sent initial frames, waiting")
 
 	doDelay(time.Duration(delay) * time.Millisecond)
-	var data [8]byte
+	// var data [8]byte
 
-	copy(data[:], "lol_ping")
+	// copy(data[:], "lol_ping")
 	log.Printf("Pinging host: %v", parsed.Host)
 	ping(parsed.Hostname())
 	for i := 1; i <= count*2; i += 2 {
@@ -249,19 +206,22 @@ func main() {
 	/* here */
 }
 
-func (a *request) ReadRequest(filename string) (err error) {
+func ReadRequest(filename string) (req *http.Request, err error) {
+	log.Printf("Loading file: %v\n", filename)
+
 	f, err := os.Open(filename)
+
 	if err != nil {
 		log.Printf("Error: %v\n", err)
-		return err
+		return nil, err
 	}
 	rawReq := bufio.NewReader(f)
-	a.Request, err = http.ReadRequest(rawReq)
+	req, err = http.ReadRequest(rawReq)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
-		return err
+		return nil, err
 	}
-	return err
+	return req, err
 }
 
 func (app *request) encodeHeaders(req *http.Request) []byte {
