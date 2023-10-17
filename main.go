@@ -10,7 +10,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -121,15 +120,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("err %v", err)
 	}
-
-	parsed, err := url.ParseRequestURI(req.URL.Host)
-	if err != nil {
-		panic(err)
+	host := req.Host
+	if !strings.Contains(host, ":") {
+		host += ":443" //add port
 	}
-	if !strings.Contains(parsed.Host, ":") {
-		parsed.Host += ":443" //add port
-	}
-	app := &request{Host: parsed.Host, peerSetting: make(map[http2.SettingID]uint32)}
+	app := &request{Host: host, peerSetting: make(map[http2.SettingID]uint32)}
 	app.henc = hpack.NewEncoder(&app.hbuf)
 
 	cfg := &tls.Config{
@@ -192,8 +187,8 @@ func main() {
 	// var data [8]byte
 
 	// copy(data[:], "lol_ping")
-	log.Printf("Pinging host: %v", parsed.Host)
-	ping(parsed.Hostname())
+	log.Printf("Pinging host: %v", host)
+	ping(strings.Split(host, ":")[0])
 	for i := 1; i <= count*2; i += 2 {
 		app.streamID = uint32(i)
 		app.framer.WriteData(app.streamID, true, []byte{})
