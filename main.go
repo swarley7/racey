@@ -88,15 +88,11 @@ func ping(address string) (err error) {
 	return err
 }
 
-func init() {
-
-}
-
 func main() {
 	var Url, headers, requestFile, method string
 	var count int
 	var delay int64
-	var debug bool
+	var debug, prettify bool
 	flag.StringVar(&Url, "url", "https://localhost:8000", "Target URL")
 	flag.StringVar(&method, "method", "GET", "HTTP Method")
 
@@ -105,6 +101,7 @@ func main() {
 	flag.IntVar(&count, "count", 1, "Number of requests to send")
 	flag.Int64Var(&delay, "delay", 1000, "Delay before sending final frames")
 	flag.BoolVar(&debug, "debug", false, "Enable http2 debugging, log TLS keys for interception")
+	flag.BoolVar(&prettify, "prettify", true, "Prettify the output of HTTP2 responses")
 
 	flag.Parse()
 
@@ -194,11 +191,16 @@ func main() {
 		app.framer.WriteData(app.streamID, true, []byte{})
 	}
 	// time.Sleep(1000 * time.Millisecond)
-	errc := make(chan error)
+	errc := make(chan error, 1)
 	go func() { errc <- app.readFrames() }()
 	<-errc
 
 	/* here */
+}
+
+func (app *request) compileResponse() (string, error) {
+
+	return "", nil
 }
 
 func ReadRequest(filename string) (req *http.Request, err error) {
@@ -258,6 +260,7 @@ func (app *request) logf(format string, args ...interface{}) {
 }
 
 func (app *request) readFrames() error {
+	outframes := map[uint32][]http2.Frame{}
 	for {
 		f, err := app.framer.ReadFrame()
 		if err != nil {
@@ -265,6 +268,7 @@ func (app *request) readFrames() error {
 		}
 		app.logf("%v", f)
 		switch f := f.(type) {
+
 		case *http2.PingFrame:
 			app.logf("  Data = %q", f.Data)
 		case *http2.SettingsFrame:
@@ -279,6 +283,7 @@ func (app *request) readFrames() error {
 			app.logf("  Last-Stream-ID = %d; Error-Code = %v (%d)", f.LastStreamID, f.ErrCode, f.ErrCode)
 		case *http2.DataFrame:
 			app.logf("  %q", f.Data())
+			outframes[f.StreamID] = append(outframes[f.StreamID], f)
 		case *http2.HeadersFrame:
 			if f.HasPriority() {
 				app.logf("  PRIORITY = %v", f.Priority)
@@ -291,6 +296,11 @@ func (app *request) readFrames() error {
 				app.hdec = hpack.NewDecoder(tableSize, app.onNewHeaderField)
 			}
 			app.hdec.Write(f.HeaderBlockFragment())
+			outframes[f.StreamID] = append(outframes[f.StreamID], f)
+		case *http2.RSTStreamFrame:
+			app.logf("  %q - [%d]", f.ErrCode.String(), f.StreamID)
+			app.logf("RESP %q", outframes[f.StreamID])
+			delete(outframes, f.StreamID)
 		case *http2.PushPromiseFrame:
 			if app.hdec == nil {
 				// TODO: if the user uses h2i to send a SETTINGS frame advertising
