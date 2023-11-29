@@ -1,6 +1,8 @@
 # racey
 Race condition tester using HTTP/2
 
+Abuses the single packet attack described in https://portswigger.net/research/smashing-the-state-machine (thanks albinowax!) to time multiple HTTP/2 requests at the same time. Can be abused to realise subtle state differences in application's handling of such requests, or to identify instances whereby time-based properties are exposed (tokens seeded on time, etc.).
+
 
 # dev server
 
