@@ -461,6 +461,76 @@ func (r *http3Request) readResponsesWithTimeout(timeout time.Duration) (map[uint
 	return responses, nil
 }
 
+// runHTTP3Attack orchestrates the full HTTP/3 single packet attack.
+// It implements the Quic-Fin-Sync technique:
+//  1. Establish QUIC connection
+//  2. Send partial requests (headers + body minus final byte)
+//  3. Wait for specified delay
+//  4. Send final bytes and FIN flags in rapid succession
+//  5. Read and return responses
+//
+// Parameters:
+//   - req: The HTTP request template to use for all streams
+//   - count: Number of concurrent requests to send
+//   - delay: Delay in milliseconds between partial requests and final byte sync
+//
+// Returns the collected responses and any error encountered.
+func runHTTP3Attack(req *http.Request, count int, delay int64) (map[uint32]*Response, error) {
+	ctx := context.Background()
+
+	// Extract host for QUIC connection
+	host := req.Host
+	if host == "" && req.URL != nil {
+		host = req.URL.Host
+	}
+	if host == "" {
+		return nil, fmt.Errorf("cannot determine host from request")
+	}
+
+	log.Printf("Establishing HTTP/3 connection to %s...", host)
+
+	// Phase 0: Establish QUIC connection
+	conn, err := dialQUIC(ctx, host, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP/3 connection failed: %w\nNote: Ensure the server supports HTTP/3 on UDP port 443", err)
+	}
+	defer conn.CloseWithError(0, "done")
+
+	log.Printf("Connected via QUIC to %v", conn.RemoteAddr())
+
+	// Create HTTP/3 request object
+	h3req := &http3Request{
+		Host:    host,
+		Request: req,
+		conn:    conn,
+	}
+
+	// Phase 1: Send partial requests (headers + body minus final byte)
+	log.Printf("Phase 1: Sending %d partial requests...", count)
+	if err := h3req.sendPartialRequests(ctx, count); err != nil {
+		return nil, fmt.Errorf("failed to send partial requests: %w", err)
+	}
+
+	// Phase 2: Wait for delay to ensure partial frames are transmitted
+	log.Printf("Phase 2: Waiting %d ms before final byte sync...", delay)
+	time.Sleep(time.Duration(delay) * time.Millisecond)
+
+	// Phase 3: Send final bytes and FIN flags (Quic-Fin-Sync)
+	log.Printf("Phase 3: Sending final bytes and FIN flags...")
+	if err := h3req.sendFinalBytes(); err != nil {
+		return nil, fmt.Errorf("failed to send final bytes: %w", err)
+	}
+
+	// Phase 4: Read responses
+	log.Printf("Phase 4: Reading responses...")
+	responses, err := h3req.readResponses()
+	if err != nil {
+		return responses, fmt.Errorf("error reading responses: %w", err)
+	}
+
+	return responses, nil
+}
+
 // convertHTTPResponse converts an *http.Response to our shared Response struct.
 // It reads the full body and extracts headers into a map.
 func convertHTTPResponse(streamID uint32, httpResp *http.Response, stream http3.RequestStream, remainingTimeout time.Duration) *Response {
