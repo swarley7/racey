@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -1092,5 +1093,557 @@ func TestSendFinalBytes_CorrectlyCountsFailedStreams(t *testing.T) {
 	}
 	if !stream2.closed {
 		t.Error("stream2 should have been closed")
+	}
+}
+
+// =============================================================================
+// Tests for readResponses
+// =============================================================================
+
+// mockResponseStream is an enhanced mock for testing readResponses.
+// It supports configurable ReadResponse behavior and body reading.
+type mockResponseStream struct {
+	mockRequestStream
+	streamID    quic.StreamID
+	response    *http.Response
+	readErr     error
+	cancelRead  bool
+	readTimeout bool
+}
+
+func (m *mockResponseStream) StreamID() quic.StreamID {
+	return m.streamID
+}
+
+func (m *mockResponseStream) ReadResponse() (*http.Response, error) {
+	if m.readTimeout {
+		// Simulate a slow response by blocking forever (will be cancelled by timeout)
+		select {}
+	}
+	if m.readErr != nil {
+		return nil, m.readErr
+	}
+	return m.response, nil
+}
+
+func (m *mockResponseStream) CancelRead(code quic.StreamErrorCode) {
+	m.cancelRead = true
+}
+
+// TestReadResponses_NoStreams verifies that readResponses returns an error
+// when called without any streams.
+func TestReadResponses_NoStreams(t *testing.T) {
+	r := &http3Request{}
+
+	_, err := r.readResponses()
+	if err == nil {
+		t.Fatal("readResponses should return error when no streams exist")
+	}
+	if !strings.Contains(err.Error(), "no streams") {
+		t.Errorf("error should mention 'no streams', got: %v", err)
+	}
+}
+
+// TestReadResponses_SingleStreamSuccess verifies that readResponses correctly
+// reads a successful response from a single stream.
+func TestReadResponses_SingleStreamSuccess(t *testing.T) {
+	body := "Hello, World!"
+	stream := &mockResponseStream{
+		streamID: 4,
+		response: &http.Response{
+			StatusCode: 200,
+			Header: http.Header{
+				"Content-Type":   []string{"text/plain"},
+				"X-Custom":       []string{"value1", "value2"},
+				"Content-Length": []string{fmt.Sprintf("%d", len(body))},
+			},
+			Body: io.NopCloser(strings.NewReader(body)),
+		},
+	}
+
+	r := &http3Request{
+		streams: []http3.RequestStream{stream},
+	}
+
+	responses, err := r.readResponsesWithTimeout(5 * time.Second)
+	if err != nil {
+		t.Fatalf("readResponses failed: %v", err)
+	}
+
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	resp, ok := responses[4]
+	if !ok {
+		t.Fatal("response for stream 4 not found")
+	}
+
+	// Verify stream ID
+	if resp.StreamID != 4 {
+		t.Errorf("expected StreamID 4, got %d", resp.StreamID)
+	}
+
+	// Verify status code
+	if resp.Status != "200" {
+		t.Errorf("expected status '200', got '%s'", resp.Status)
+	}
+
+	// Verify headers (should be lowercased)
+	if resp.Headers["content-type"] != "text/plain" {
+		t.Errorf("expected Content-Type 'text/plain', got '%s'", resp.Headers["content-type"])
+	}
+	if resp.Headers["x-custom"] != "value1, value2" {
+		t.Errorf("expected X-Custom 'value1, value2', got '%s'", resp.Headers["x-custom"])
+	}
+
+	// Verify :status pseudo-header was added
+	if resp.Headers[":status"] != "200" {
+		t.Errorf("expected :status '200', got '%s'", resp.Headers[":status"])
+	}
+
+	// Verify body
+	if string(resp.Body) != body {
+		t.Errorf("expected body '%s', got '%s'", body, string(resp.Body))
+	}
+
+	// Verify no error
+	if resp.Error != "" {
+		t.Errorf("expected no error, got '%s'", resp.Error)
+	}
+}
+
+// TestReadResponses_MultipleStreamsSuccess verifies that readResponses correctly
+// reads responses from multiple streams concurrently.
+func TestReadResponses_MultipleStreamsSuccess(t *testing.T) {
+	streams := []http3.RequestStream{
+		&mockResponseStream{
+			streamID: 0,
+			response: &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"X-Stream": []string{"first"}},
+				Body:       io.NopCloser(strings.NewReader("body1")),
+			},
+		},
+		&mockResponseStream{
+			streamID: 4,
+			response: &http.Response{
+				StatusCode: 201,
+				Header:     http.Header{"X-Stream": []string{"second"}},
+				Body:       io.NopCloser(strings.NewReader("body2")),
+			},
+		},
+		&mockResponseStream{
+			streamID: 8,
+			response: &http.Response{
+				StatusCode: 404,
+				Header:     http.Header{"X-Stream": []string{"third"}},
+				Body:       io.NopCloser(strings.NewReader("not found")),
+			},
+		},
+	}
+
+	r := &http3Request{streams: streams}
+
+	responses, err := r.readResponsesWithTimeout(5 * time.Second)
+	if err != nil {
+		t.Fatalf("readResponses failed: %v", err)
+	}
+
+	if len(responses) != 3 {
+		t.Fatalf("expected 3 responses, got %d", len(responses))
+	}
+
+	// Verify each response
+	testCases := []struct {
+		streamID uint32
+		status   string
+		header   string
+		body     string
+	}{
+		{0, "200", "first", "body1"},
+		{4, "201", "second", "body2"},
+		{8, "404", "third", "not found"},
+	}
+
+	for _, tc := range testCases {
+		resp, ok := responses[tc.streamID]
+		if !ok {
+			t.Errorf("response for stream %d not found", tc.streamID)
+			continue
+		}
+		if resp.Status != tc.status {
+			t.Errorf("stream %d: expected status '%s', got '%s'", tc.streamID, tc.status, resp.Status)
+		}
+		if resp.Headers["x-stream"] != tc.header {
+			t.Errorf("stream %d: expected x-stream '%s', got '%s'", tc.streamID, tc.header, resp.Headers["x-stream"])
+		}
+		if string(resp.Body) != tc.body {
+			t.Errorf("stream %d: expected body '%s', got '%s'", tc.streamID, tc.body, string(resp.Body))
+		}
+	}
+}
+
+// TestReadResponses_StreamReadError verifies that readResponses handles
+// stream read errors gracefully, capturing the error and continuing.
+func TestReadResponses_StreamReadError(t *testing.T) {
+	streams := []http3.RequestStream{
+		&mockResponseStream{
+			streamID: 0,
+			response: &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader("success")),
+			},
+		},
+		&mockResponseStream{
+			streamID: 4,
+			readErr:  fmt.Errorf("stream reset by peer"),
+		},
+		&mockResponseStream{
+			streamID: 8,
+			response: &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader("also success")),
+			},
+		},
+	}
+
+	r := &http3Request{streams: streams}
+
+	responses, err := r.readResponsesWithTimeout(5 * time.Second)
+
+	// Should NOT return error because not ALL streams failed
+	if err != nil {
+		t.Fatalf("readResponses should not return error when some streams succeed, got: %v", err)
+	}
+
+	if len(responses) != 3 {
+		t.Fatalf("expected 3 responses, got %d", len(responses))
+	}
+
+	// Verify stream 0 succeeded
+	if responses[0].Error != "" {
+		t.Errorf("stream 0 should have no error, got: %s", responses[0].Error)
+	}
+	if string(responses[0].Body) != "success" {
+		t.Errorf("stream 0 body mismatch")
+	}
+
+	// Verify stream 4 has error captured
+	if responses[4].Error == "" {
+		t.Error("stream 4 should have error captured")
+	}
+	if !strings.Contains(responses[4].Error, "stream reset by peer") {
+		t.Errorf("stream 4 error should mention 'stream reset by peer', got: %s", responses[4].Error)
+	}
+
+	// Verify stream 8 succeeded
+	if responses[8].Error != "" {
+		t.Errorf("stream 8 should have no error, got: %s", responses[8].Error)
+	}
+}
+
+// TestReadResponses_AllStreamsFail verifies that readResponses returns an error
+// when ALL streams fail.
+func TestReadResponses_AllStreamsFail(t *testing.T) {
+	streams := []http3.RequestStream{
+		&mockResponseStream{
+			streamID: 0,
+			readErr:  fmt.Errorf("error 1"),
+		},
+		&mockResponseStream{
+			streamID: 4,
+			readErr:  fmt.Errorf("error 2"),
+		},
+	}
+
+	r := &http3Request{streams: streams}
+
+	responses, err := r.readResponsesWithTimeout(5 * time.Second)
+
+	// Should return error because ALL streams failed
+	if err == nil {
+		t.Fatal("readResponses should return error when all streams fail")
+	}
+	if !strings.Contains(err.Error(), "all 2 streams failed") {
+		t.Errorf("error should mention 'all 2 streams failed', got: %v", err)
+	}
+
+	// Responses should still be populated with errors
+	if len(responses) != 2 {
+		t.Fatalf("expected 2 responses with errors, got %d", len(responses))
+	}
+	if responses[0].Error == "" || responses[4].Error == "" {
+		t.Error("failed responses should have error populated")
+	}
+}
+
+// TestReadResponses_Timeout verifies that readResponses handles timeout
+// for slow streams properly.
+func TestReadResponses_Timeout(t *testing.T) {
+	streams := []http3.RequestStream{
+		&mockResponseStream{
+			streamID: 0,
+			response: &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader("fast")),
+			},
+		},
+		&mockResponseStream{
+			streamID:    4,
+			readTimeout: true, // Will block forever
+		},
+	}
+
+	r := &http3Request{streams: streams}
+
+	// Use a short timeout
+	responses, err := r.readResponsesWithTimeout(100 * time.Millisecond)
+
+	// Should NOT return error because not ALL streams failed
+	if err != nil {
+		t.Fatalf("readResponses should not return error when only some streams timeout, got: %v", err)
+	}
+
+	if len(responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(responses))
+	}
+
+	// Verify stream 0 succeeded
+	if responses[0].Error != "" {
+		t.Errorf("stream 0 should have no error, got: %s", responses[0].Error)
+	}
+
+	// Verify stream 4 timed out
+	if responses[4].Error == "" {
+		t.Error("stream 4 should have timeout error")
+	}
+	if !strings.Contains(responses[4].Error, "timeout") {
+		t.Errorf("stream 4 error should mention 'timeout', got: %s", responses[4].Error)
+	}
+
+	// Verify CancelRead was called on the timed-out stream
+	timedOutStream := streams[1].(*mockResponseStream)
+	if !timedOutStream.cancelRead {
+		t.Error("CancelRead should have been called on timed-out stream")
+	}
+}
+
+// TestReadResponses_EmptyBody verifies that readResponses handles responses
+// with empty bodies correctly.
+func TestReadResponses_EmptyBody(t *testing.T) {
+	stream := &mockResponseStream{
+		streamID: 4,
+		response: &http.Response{
+			StatusCode: 204, // No Content
+			Header:     http.Header{"X-Empty": []string{"true"}},
+			Body:       io.NopCloser(strings.NewReader("")),
+		},
+	}
+
+	r := &http3Request{streams: []http3.RequestStream{stream}}
+
+	responses, err := r.readResponsesWithTimeout(5 * time.Second)
+	if err != nil {
+		t.Fatalf("readResponses failed: %v", err)
+	}
+
+	resp := responses[4]
+	if resp.Status != "204" {
+		t.Errorf("expected status '204', got '%s'", resp.Status)
+	}
+	if len(resp.Body) != 0 {
+		t.Errorf("expected empty body, got %d bytes", len(resp.Body))
+	}
+	if resp.Error != "" {
+		t.Errorf("expected no error, got '%s'", resp.Error)
+	}
+}
+
+// TestReadResponses_NilBody verifies that readResponses handles responses
+// with nil body correctly.
+func TestReadResponses_NilBody(t *testing.T) {
+	stream := &mockResponseStream{
+		streamID: 4,
+		response: &http.Response{
+			StatusCode: 204,
+			Header:     http.Header{},
+			Body:       nil, // Nil body
+		},
+	}
+
+	r := &http3Request{streams: []http3.RequestStream{stream}}
+
+	responses, err := r.readResponsesWithTimeout(5 * time.Second)
+	if err != nil {
+		t.Fatalf("readResponses failed: %v", err)
+	}
+
+	resp := responses[4]
+	if resp.Body != nil && len(resp.Body) != 0 {
+		t.Errorf("expected nil/empty body, got %d bytes", len(resp.Body))
+	}
+	if resp.Error != "" {
+		t.Errorf("expected no error, got '%s'", resp.Error)
+	}
+}
+
+// TestReadResponses_CompatibilityWithAnalyzeResponses verifies that the Response
+// struct returned by readResponses is compatible with analyzeResponses().
+func TestReadResponses_CompatibilityWithAnalyzeResponses(t *testing.T) {
+	// Create streams with varying responses to trigger analysis
+	streams := []http3.RequestStream{
+		&mockResponseStream{
+			streamID: 0,
+			response: &http.Response{
+				StatusCode: 200,
+				Header: http.Header{
+					"Content-Type": []string{"application/json"},
+					"X-Request-Id": []string{"abc123"},
+				},
+				Body: io.NopCloser(strings.NewReader(`{"id": 1}`)),
+			},
+		},
+		&mockResponseStream{
+			streamID: 4,
+			response: &http.Response{
+				StatusCode: 200,
+				Header: http.Header{
+					"Content-Type": []string{"application/json"},
+					"X-Request-Id": []string{"def456"}, // Different value
+				},
+				Body: io.NopCloser(strings.NewReader(`{"id": 2}`)), // Different body
+			},
+		},
+	}
+
+	r := &http3Request{streams: streams}
+
+	responses, err := r.readResponsesWithTimeout(5 * time.Second)
+	if err != nil {
+		t.Fatalf("readResponses failed: %v", err)
+	}
+
+	// Verify the response format matches what analyzeResponses expects
+	for streamID, resp := range responses {
+		// StreamID should match map key
+		if resp.StreamID != streamID {
+			t.Errorf("StreamID mismatch: map key %d, struct field %d", streamID, resp.StreamID)
+		}
+
+		// Status should be string representation of status code
+		if resp.Status != "200" {
+			t.Errorf("stream %d: unexpected status format '%s'", streamID, resp.Status)
+		}
+
+		// Headers should be map[string]string with lowercase keys
+		if _, ok := resp.Headers["content-type"]; !ok {
+			t.Errorf("stream %d: headers should have lowercase 'content-type'", streamID)
+		}
+
+		// :status pseudo-header should be set
+		if resp.Headers[":status"] != "200" {
+			t.Errorf("stream %d: :status pseudo-header not set correctly", streamID)
+		}
+
+		// Body should be []byte
+		if len(resp.Body) == 0 {
+			t.Errorf("stream %d: body should not be empty", streamID)
+		}
+	}
+
+	// The response format should work with analyzeResponses
+	// We can't easily test analyzeResponses output, but we verify the struct is correct
+	t.Log("Response format is compatible with analyzeResponses()")
+}
+
+// TestReadResponses_IntegrationGoogle performs an end-to-end test against Google's HTTP/3 servers.
+func TestReadResponses_IntegrationGoogle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Connect to Google (known to support HTTP/3)
+	conn, err := dialQUIC(ctx, "www.google.com:443", nil, nil)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer conn.CloseWithError(0, "test done")
+
+	t.Log("successfully connected to www.google.com")
+
+	// Create HTTP/3 request
+	req, err := http.NewRequest("GET", "https://www.google.com/", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("User-Agent", "racey-test/1.0")
+
+	r := &http3Request{
+		Host:    "www.google.com",
+		Request: req,
+	}
+	r.conn = conn
+
+	// Send partial requests (2 streams)
+	if err := r.sendPartialRequests(ctx, 2); err != nil {
+		t.Fatalf("sendPartialRequests failed: %v", err)
+	}
+	t.Logf("opened %d streams", len(r.streams))
+
+	// Send final bytes
+	if err := r.sendFinalBytes(); err != nil {
+		t.Fatalf("sendFinalBytes failed: %v", err)
+	}
+	t.Log("sent final bytes")
+
+	// Read responses
+	responses, err := r.readResponses()
+	if err != nil {
+		t.Fatalf("readResponses failed: %v", err)
+	}
+
+	t.Logf("received %d responses", len(responses))
+
+	// Verify we got responses
+	if len(responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(responses))
+	}
+
+	// Verify response format
+	for streamID, resp := range responses {
+		if resp.Error != "" {
+			t.Errorf("stream %d had error: %s", streamID, resp.Error)
+			continue
+		}
+
+		// Status should be a valid HTTP status code
+		if resp.Status == "" {
+			t.Errorf("stream %d: empty status", streamID)
+		}
+
+		// Should have headers
+		if len(resp.Headers) == 0 {
+			t.Errorf("stream %d: no headers", streamID)
+		}
+
+		// Should have :status pseudo-header
+		if resp.Headers[":status"] == "" {
+			t.Errorf("stream %d: missing :status pseudo-header", streamID)
+		}
+
+		// Body should not be empty for a GET to Google
+		if len(resp.Body) == 0 {
+			t.Logf("stream %d: empty body (may be expected for redirect)", streamID)
+		}
+
+		t.Logf("stream %d: status=%s, headers=%d, body=%d bytes",
+			streamID, resp.Status, len(resp.Headers), len(resp.Body))
 	}
 }

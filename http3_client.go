@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -338,10 +340,159 @@ func (r *http3Request) sendFinalBytes() error {
 
 // readResponses collects HTTP/3 responses from all streams and
 // converts them to the shared Response struct for analysis.
+//
+// For each stream:
+//   - Calls ReadResponse() to get the HTTP response (headers)
+//   - Reads the response body fully
+//   - Converts to the shared Response struct used by analyzeResponses()
+//
+// The function uses concurrent goroutines to read responses in parallel,
+// with a configurable timeout (default 30 seconds) for slow responses.
+//
+// Error handling:
+//   - Individual stream errors are captured in Response.Error
+//   - The function continues processing other streams even if some fail
+//   - Only returns an error if ALL streams fail
+//
+// Returns a map of StreamID (as uint32) to Response for compatibility
+// with the existing analyzeResponses() function.
 func (r *http3Request) readResponses() (map[uint32]*Response, error) {
-	// TODO: Implement response collection
-	// - Call ReadResponse() on each RequestStream
-	// - Parse response headers and body
-	// - Convert to Response struct (shared with HTTP/2)
-	return nil, fmt.Errorf("readResponses not yet implemented")
+	return r.readResponsesWithTimeout(30 * time.Second)
+}
+
+// readResponsesWithTimeout is the internal implementation that accepts a custom timeout.
+// This is useful for testing with shorter timeouts.
+func (r *http3Request) readResponsesWithTimeout(timeout time.Duration) (map[uint32]*Response, error) {
+	if len(r.streams) == 0 {
+		return nil, fmt.Errorf("no streams to read responses from: call sendPartialRequests first")
+	}
+
+	// Create response map with mutex for concurrent access
+	responses := make(map[uint32]*Response)
+	var mu sync.Mutex
+
+	// Use WaitGroup to wait for all goroutines
+	var wg sync.WaitGroup
+
+	// Track how many streams succeed vs fail
+	var successCount, failCount int32
+
+	// Read responses concurrently from all streams
+	for i, stream := range r.streams {
+		wg.Add(1)
+		go func(idx int, s http3.RequestStream) {
+			defer wg.Done()
+
+			// Get stream ID for tracking
+			streamID := uint32(s.StreamID())
+
+			// Create context with timeout for this response read
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			// Channel to receive the response result
+			type readResult struct {
+				resp *http.Response
+				err  error
+			}
+			resultCh := make(chan readResult, 1)
+
+			// Read response in a goroutine so we can apply timeout
+			go func() {
+				resp, err := s.ReadResponse()
+				resultCh <- readResult{resp, err}
+			}()
+
+			// Wait for response or timeout
+			select {
+			case result := <-resultCh:
+				if result.err != nil {
+					// Stream failed to read response
+					mu.Lock()
+					responses[streamID] = &Response{
+						StreamID: streamID,
+						Error:    fmt.Sprintf("failed to read response: %v", result.err),
+					}
+					failCount++
+					mu.Unlock()
+					log.Printf("Stream %d: failed to read response: %v", streamID, result.err)
+					return
+				}
+
+				// Successfully got response headers, now read the body
+				response := convertHTTPResponse(streamID, result.resp, s, timeout-time.Since(time.Now()))
+				mu.Lock()
+				responses[streamID] = response
+				if response.Error != "" {
+					failCount++
+				} else {
+					successCount++
+				}
+				mu.Unlock()
+
+			case <-ctx.Done():
+				// Timeout reading response
+				mu.Lock()
+				responses[streamID] = &Response{
+					StreamID: streamID,
+					Error:    fmt.Sprintf("timeout reading response after %v", timeout),
+				}
+				failCount++
+				mu.Unlock()
+				log.Printf("Stream %d: timeout reading response", streamID)
+
+				// Cancel the stream to clean up
+				s.CancelRead(0x100) // H3_REQUEST_CANCELLED
+			}
+		}(i, stream)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Log summary
+	log.Printf("Read %d responses: %d successful, %d failed", len(responses), successCount, failCount)
+
+	// Only return error if ALL streams failed
+	if failCount == int32(len(r.streams)) && failCount > 0 {
+		return responses, fmt.Errorf("all %d streams failed to read responses", len(r.streams))
+	}
+
+	return responses, nil
+}
+
+// convertHTTPResponse converts an *http.Response to our shared Response struct.
+// It reads the full body and extracts headers into a map.
+func convertHTTPResponse(streamID uint32, httpResp *http.Response, stream http3.RequestStream, remainingTimeout time.Duration) *Response {
+	resp := &Response{
+		StreamID: streamID,
+		Status:   fmt.Sprintf("%d", httpResp.StatusCode),
+		Headers:  make(map[string]string),
+	}
+
+	// Copy headers, converting to single string values
+	// HTTP/3 headers are already lowercase per spec
+	for name, values := range httpResp.Header {
+		// Join multiple values with comma (standard HTTP header format)
+		resp.Headers[strings.ToLower(name)] = strings.Join(values, ", ")
+	}
+
+	// Add the :status pseudo-header for compatibility with HTTP/2 response analysis
+	resp.Headers[":status"] = resp.Status
+
+	// Read the response body fully
+	// The body is read from the stream after ReadResponse() has parsed headers
+	if httpResp.Body != nil {
+		defer httpResp.Body.Close()
+
+		body, err := io.ReadAll(httpResp.Body)
+		if err != nil {
+			resp.Error = fmt.Sprintf("failed to read response body: %v", err)
+			log.Printf("Stream %d: failed to read body: %v", streamID, err)
+		} else {
+			resp.Body = body
+		}
+	}
+
+	return resp
 }
