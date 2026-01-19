@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -18,8 +21,12 @@ type http3Request struct {
 	Request    *http.Request
 	conn       quic.Connection
 	clientConn *http3.ClientConn
-	streams    []*http3.RequestStream
+	streams    []http3.RequestStream
 	responses  []*Response
+	// finalBytes holds the last byte of the request body for each stream,
+	// to be sent during the synchronized final byte phase.
+	// For requests without a body, this will be nil (empty DATA frame with FIN).
+	finalBytes [][]byte
 }
 
 // dialQUIC establishes a QUIC connection to the target host with TLS.
@@ -96,13 +103,164 @@ func dialQUIC(ctx context.Context, host string, tlsConfig *tls.Config, quicConfi
 // sendPartialRequests implements Phase 1 of the Quic-Fin-Sync technique.
 // It opens multiple QUIC streams, sends HEADERS frames for each request,
 // but withholds the final byte/FIN flag to keep requests incomplete.
+//
+// For requests with a body:
+//   - Sends HEADERS frame
+//   - Writes all body data except the final byte
+//   - Stores the final byte for later synchronization
+//
+// For requests without a body:
+//   - Sends HEADERS frame only
+//   - Stores nil for final bytes (empty DATA frame with FIN will be sent)
+//
+// The function requires that r.conn is already established via dialQUIC.
+// It creates an http3.ClientConn and stores it in r.clientConn.
 func (r *http3Request) sendPartialRequests(ctx context.Context, count int) error {
-	// TODO: Implement partial request sending
-	// - Use clientConn.OpenRequestStream() for each request
-	// - Send request headers via SendRequestHeader()
-	// - Write request body (if any) minus final byte
-	// - Store streams for later FIN synchronization
-	return fmt.Errorf("sendPartialRequests not yet implemented")
+	if r.conn == nil {
+		return fmt.Errorf("QUIC connection not established: call dialQUIC first")
+	}
+	if r.Request == nil {
+		return fmt.Errorf("request not set: set r.Request before calling sendPartialRequests")
+	}
+	if count <= 0 {
+		return fmt.Errorf("count must be positive, got %d", count)
+	}
+
+	// Create HTTP/3 transport and client connection
+	transport := &http3.Transport{}
+	r.clientConn = transport.NewClientConn(r.conn)
+
+	// Initialize slices for tracking streams and final bytes
+	r.streams = make([]http3.RequestStream, 0, count)
+	r.finalBytes = make([][]byte, 0, count)
+
+	// Read the request body once if present, so we can split it for each stream
+	var bodyData []byte
+	if r.Request.Body != nil {
+		var err error
+		bodyData, err = io.ReadAll(r.Request.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read request body: %w", err)
+		}
+		// Close the original body
+		r.Request.Body.Close()
+	}
+
+	// Track how many streams we've successfully opened
+	successfullyOpened := 0
+
+	for i := 0; i < count; i++ {
+		// Open a new request stream
+		stream, err := r.clientConn.OpenRequestStream(ctx)
+		if err != nil {
+			// Check if we hit the server's stream limit
+			if isStreamLimitError(err) {
+				log.Printf("WARNING: Server MAX_STREAMS limit reached after opening %d streams (requested %d)", successfullyOpened, count)
+				if successfullyOpened == 0 {
+					return fmt.Errorf("server MAX_STREAMS limit prevents opening any streams: %w", err)
+				}
+				// Continue with the streams we have
+				break
+			}
+			return fmt.Errorf("failed to open request stream %d: %w", i, err)
+		}
+
+		// Clone the request for this stream
+		clonedReq := cloneRequest(r.Request, bodyData)
+
+		// Send request headers
+		// Note: SendRequestHeader is for requests without a body.
+		// For requests with a body, we need to use Write() which implicitly sends headers.
+		if len(bodyData) == 0 {
+			// No body: send headers only via SendRequestHeader
+			if err := stream.SendRequestHeader(clonedReq); err != nil {
+				return fmt.Errorf("failed to send headers on stream %d: %w", i, err)
+			}
+			// Store nil for final bytes - we'll send empty DATA with FIN
+			r.finalBytes = append(r.finalBytes, nil)
+		} else {
+			// Has body: we need to send headers + partial body
+			// The http3 package's RequestStream.Write() will send headers on first write.
+			// But we want to send headers first, then body data minus final byte.
+
+			// First, send the headers using SendRequestHeader
+			// Note: According to the docs, SendRequestHeader can only be used for
+			// requests without a body AND cannot be called after Write().
+			// For requests WITH a body, we need a different approach.
+
+			// Actually, looking at the http3 API more carefully:
+			// - SendRequestHeader: for requests without body
+			// - Write: sends headers (if not sent) + body data
+			// - Close: sends FIN
+
+			// For our use case with body, we need to:
+			// 1. Write headers + all body data except last byte
+			// 2. NOT call Close (that would send FIN)
+			// 3. Later call Write(lastByte) + Close()
+
+			// The http3 RequestStream doesn't have a separate SendRequestHeader
+			// for requests with bodies. Instead, we write directly.
+
+			// Write all but the final byte
+			partialBody := bodyData[:len(bodyData)-1]
+			finalByte := bodyData[len(bodyData)-1:]
+
+			// Write partial body (this sends headers + body data, but no FIN)
+			if _, err := stream.Write(partialBody); err != nil {
+				return fmt.Errorf("failed to write partial body on stream %d: %w", i, err)
+			}
+
+			// Store the final byte for later synchronization
+			r.finalBytes = append(r.finalBytes, finalByte)
+		}
+
+		r.streams = append(r.streams, stream)
+		successfullyOpened++
+	}
+
+	log.Printf("Opened %d HTTP/3 streams with partial requests", successfullyOpened)
+	return nil
+}
+
+// isStreamLimitError checks if the error indicates the server's stream limit was reached.
+func isStreamLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// quic-go returns "too many open streams" when limit is reached
+	return strings.Contains(errStr, "too many open streams") ||
+		strings.Contains(errStr, "stream limit") ||
+		strings.Contains(errStr, "MAX_STREAMS")
+}
+
+// cloneRequest creates a clone of the http.Request suitable for sending on a new stream.
+// If bodyData is provided, it creates a new body reader from it.
+func cloneRequest(req *http.Request, bodyData []byte) *http.Request {
+	// Clone the request
+	cloned := req.Clone(req.Context())
+
+	// Set up the body if we have data
+	if len(bodyData) > 0 {
+		cloned.Body = io.NopCloser(bytes.NewReader(bodyData))
+		cloned.ContentLength = int64(len(bodyData))
+	} else {
+		cloned.Body = nil
+		cloned.ContentLength = 0
+	}
+
+	// Ensure required HTTP/3 pseudo-headers are properly set
+	// :authority comes from Host
+	if cloned.Host == "" && cloned.URL != nil {
+		cloned.Host = cloned.URL.Host
+	}
+
+	// :scheme should be https for HTTP/3
+	if cloned.URL != nil && cloned.URL.Scheme == "" {
+		cloned.URL.Scheme = "https"
+	}
+
+	return cloned
 }
 
 // sendFinalBytes implements Phase 2 of the Quic-Fin-Sync technique.
