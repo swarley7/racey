@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 // TestDialQUIC_DefaultTLSConfig verifies that dialQUIC creates proper default
@@ -627,4 +628,469 @@ func TestSendPartialRequests_IntegrationWithBody(t *testing.T) {
 	}
 
 	t.Logf("Successfully opened %d streams with partial body data (withheld last byte)", len(r.streams))
+}
+
+// =============================================================================
+// sendFinalBytes tests
+// =============================================================================
+
+// TestSendFinalBytes_NoStreams verifies that an error is returned when
+// there are no streams to send final bytes on.
+func TestSendFinalBytes_NoStreams(t *testing.T) {
+	r := &http3Request{
+		streams:    nil, // No streams
+		finalBytes: nil,
+	}
+
+	err := r.sendFinalBytes()
+	if err == nil {
+		t.Fatal("expected error when no streams exist")
+	}
+	if !strings.Contains(err.Error(), "no streams to send final bytes on") {
+		t.Errorf("expected 'no streams to send final bytes on' error, got: %v", err)
+	}
+}
+
+// TestSendFinalBytes_EmptyStreams verifies that an error is returned when
+// the streams slice is empty.
+func TestSendFinalBytes_EmptyStreams(t *testing.T) {
+	r := &http3Request{
+		streams:    []http3.RequestStream{}, // Empty slice
+		finalBytes: [][]byte{},
+	}
+
+	err := r.sendFinalBytes()
+	if err == nil {
+		t.Fatal("expected error when streams slice is empty")
+	}
+	if !strings.Contains(err.Error(), "no streams to send final bytes on") {
+		t.Errorf("expected 'no streams to send final bytes on' error, got: %v", err)
+	}
+}
+
+// TestSendFinalBytes_IntegrationHeadersOnly is an integration test that
+// verifies sendFinalBytes works for GET requests (headers only, no body).
+// This completes the full Quic-Fin-Sync cycle: sendPartialRequests + sendFinalBytes.
+func TestSendFinalBytes_IntegrationHeadersOnly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	// Try multiple known HTTP/3 servers
+	servers := []string{"www.google.com", "cloudflare.com", "www.cloudflare.com"}
+
+	var conn quic.Connection
+	var lastErr error
+	var serverUsed string
+
+	for _, server := range servers {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		c, err := dialQUIC(ctx, server+":443", nil, nil)
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			t.Logf("failed to connect to %s: %v (trying next)", server, err)
+			continue
+		}
+
+		conn = c
+		serverUsed = server
+		t.Logf("successfully connected to %s", server)
+		break
+	}
+
+	if conn == nil {
+		t.Skipf("could not connect to any HTTP/3 server (network may be restricted): %v", lastErr)
+	}
+	defer conn.CloseWithError(0, "test complete")
+
+	// Create a GET request (no body)
+	req, _ := http.NewRequest("GET", "https://"+serverUsed+"/", nil)
+	req.Header.Set("User-Agent", "racey-test/1.0")
+
+	r := &http3Request{
+		Host:    serverUsed + ":443",
+		conn:    conn,
+		Request: req,
+	}
+
+	// Phase 1: Open 3 streams with partial requests
+	ctx := context.Background()
+	err := r.sendPartialRequests(ctx, 3)
+	if err != nil {
+		t.Fatalf("sendPartialRequests failed: %v", err)
+	}
+
+	// Verify streams were opened
+	if len(r.streams) != 3 {
+		t.Fatalf("expected 3 streams, got %d", len(r.streams))
+	}
+
+	// Phase 2: Send final bytes and FIN flags
+	err = r.sendFinalBytes()
+	if err != nil {
+		t.Fatalf("sendFinalBytes failed: %v", err)
+	}
+
+	t.Logf("Successfully sent final bytes and FIN flags on %d streams (headers-only)", len(r.streams))
+}
+
+// TestSendFinalBytes_IntegrationWithBody is an integration test that
+// verifies sendFinalBytes works for POST requests with body.
+// This completes the full Quic-Fin-Sync cycle with body data.
+func TestSendFinalBytes_IntegrationWithBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	// Try multiple known HTTP/3 servers
+	servers := []string{"www.google.com", "cloudflare.com", "www.cloudflare.com"}
+
+	var conn quic.Connection
+	var lastErr error
+	var serverUsed string
+
+	for _, server := range servers {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		c, err := dialQUIC(ctx, server+":443", nil, nil)
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			t.Logf("failed to connect to %s: %v (trying next)", server, err)
+			continue
+		}
+
+		conn = c
+		serverUsed = server
+		t.Logf("successfully connected to %s", server)
+		break
+	}
+
+	if conn == nil {
+		t.Skipf("could not connect to any HTTP/3 server (network may be restricted): %v", lastErr)
+	}
+	defer conn.CloseWithError(0, "test complete")
+
+	// Create a POST request with body
+	bodyContent := "test body content for HTTP/3"
+	req, _ := http.NewRequest("POST", "https://"+serverUsed+"/", strings.NewReader(bodyContent))
+	req.Header.Set("User-Agent", "racey-test/1.0")
+	req.Header.Set("Content-Type", "text/plain")
+
+	r := &http3Request{
+		Host:    serverUsed + ":443",
+		conn:    conn,
+		Request: req,
+	}
+
+	// Phase 1: Open 2 streams with partial requests
+	ctx := context.Background()
+	err := r.sendPartialRequests(ctx, 2)
+	if err != nil {
+		t.Fatalf("sendPartialRequests failed: %v", err)
+	}
+
+	// Verify final bytes were stored (last byte of body)
+	for i, fb := range r.finalBytes {
+		if fb == nil || len(fb) == 0 {
+			t.Errorf("finalBytes[%d] should contain the last byte of body", i)
+		}
+	}
+
+	// Phase 2: Send final bytes and FIN flags
+	err = r.sendFinalBytes()
+	if err != nil {
+		t.Fatalf("sendFinalBytes failed: %v", err)
+	}
+
+	t.Logf("Successfully sent final bytes and FIN flags on %d streams (with body)", len(r.streams))
+}
+
+// TestSendFinalBytes_TightLoop verifies that sendFinalBytes processes all
+// streams in rapid succession (timing test).
+func TestSendFinalBytes_TightLoop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	// Try multiple known HTTP/3 servers
+	servers := []string{"www.google.com", "cloudflare.com", "www.cloudflare.com"}
+
+	var conn quic.Connection
+	var lastErr error
+	var serverUsed string
+
+	for _, server := range servers {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		c, err := dialQUIC(ctx, server+":443", nil, nil)
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			t.Logf("failed to connect to %s: %v (trying next)", server, err)
+			continue
+		}
+
+		conn = c
+		serverUsed = server
+		t.Logf("successfully connected to %s", server)
+		break
+	}
+
+	if conn == nil {
+		t.Skipf("could not connect to any HTTP/3 server (network may be restricted): %v", lastErr)
+	}
+	defer conn.CloseWithError(0, "test complete")
+
+	// Create a GET request
+	req, _ := http.NewRequest("GET", "https://"+serverUsed+"/", nil)
+	req.Header.Set("User-Agent", "racey-test/1.0")
+
+	r := &http3Request{
+		Host:    serverUsed + ":443",
+		conn:    conn,
+		Request: req,
+	}
+
+	// Open 5 streams
+	ctx := context.Background()
+	err := r.sendPartialRequests(ctx, 5)
+	if err != nil {
+		t.Fatalf("sendPartialRequests failed: %v", err)
+	}
+
+	// Measure time to send final bytes
+	start := time.Now()
+	err = r.sendFinalBytes()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("sendFinalBytes failed: %v", err)
+	}
+
+	// All operations should happen very quickly (under 100ms for local operations)
+	// Network latency could add some time, but it should still be well under 1 second
+	// The point is that we're not adding artificial delays between streams
+	if elapsed > time.Second {
+		t.Errorf("sendFinalBytes took too long (%v), should be rapid succession", elapsed)
+	}
+
+	t.Logf("sendFinalBytes completed in %v for %d streams (rapid succession verified)", elapsed, len(r.streams))
+}
+
+// TestSendFinalBytes_NilFinalByte verifies that sendFinalBytes handles streams
+// with nil final bytes (headers-only requests).
+func TestSendFinalBytes_NilFinalByte(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	// Try multiple known HTTP/3 servers
+	servers := []string{"www.google.com", "cloudflare.com", "www.cloudflare.com"}
+
+	var conn quic.Connection
+	var lastErr error
+	var serverUsed string
+
+	for _, server := range servers {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		c, err := dialQUIC(ctx, server+":443", nil, nil)
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			t.Logf("failed to connect to %s: %v (trying next)", server, err)
+			continue
+		}
+
+		conn = c
+		serverUsed = server
+		t.Logf("successfully connected to %s", server)
+		break
+	}
+
+	if conn == nil {
+		t.Skipf("could not connect to any HTTP/3 server (network may be restricted): %v", lastErr)
+	}
+	defer conn.CloseWithError(0, "test complete")
+
+	// Create a GET request (no body, so finalBytes will be nil)
+	req, _ := http.NewRequest("GET", "https://"+serverUsed+"/", nil)
+	req.Header.Set("User-Agent", "racey-test/1.0")
+
+	r := &http3Request{
+		Host:    serverUsed + ":443",
+		conn:    conn,
+		Request: req,
+	}
+
+	// Open streams
+	ctx := context.Background()
+	err := r.sendPartialRequests(ctx, 2)
+	if err != nil {
+		t.Fatalf("sendPartialRequests failed: %v", err)
+	}
+
+	// Verify finalBytes are all nil (no body)
+	for i, fb := range r.finalBytes {
+		if fb != nil {
+			t.Errorf("finalBytes[%d] should be nil for GET request, got %v", i, fb)
+		}
+	}
+
+	// sendFinalBytes should still work - it will just send Close() without Write()
+	err = r.sendFinalBytes()
+	if err != nil {
+		t.Fatalf("sendFinalBytes failed for headers-only requests: %v", err)
+	}
+
+	t.Logf("Successfully handled %d streams with nil final bytes", len(r.streams))
+}
+
+// =============================================================================
+// Mock stream for unit testing error handling
+// =============================================================================
+
+// mockRequestStream implements http3.RequestStream for testing error scenarios.
+type mockRequestStream struct {
+	writeErr error // Error to return from Write
+	closeErr error // Error to return from Close
+	written  []byte
+	closed   bool
+}
+
+func (m *mockRequestStream) Write(p []byte) (n int, err error) {
+	if m.writeErr != nil {
+		return 0, m.writeErr
+	}
+	m.written = append(m.written, p...)
+	return len(p), nil
+}
+
+func (m *mockRequestStream) Close() error {
+	m.closed = true
+	return m.closeErr
+}
+
+// Implement remaining http3.RequestStream interface methods (no-ops for testing)
+func (m *mockRequestStream) Read(p []byte) (n int, err error)                { return 0, nil }
+func (m *mockRequestStream) StreamID() quic.StreamID                         { return 0 }
+func (m *mockRequestStream) CancelWrite(code quic.StreamErrorCode)           {}
+func (m *mockRequestStream) CancelRead(code quic.StreamErrorCode)            {}
+func (m *mockRequestStream) SetDeadline(t time.Time) error                   { return nil }
+func (m *mockRequestStream) SetReadDeadline(t time.Time) error               { return nil }
+func (m *mockRequestStream) SetWriteDeadline(t time.Time) error              { return nil }
+func (m *mockRequestStream) Context() context.Context                        { return context.Background() }
+func (m *mockRequestStream) SendRequestHeader(req *http.Request) error       { return nil }
+func (m *mockRequestStream) ReadResponse() (*http.Response, error)           { return nil, nil }
+func (m *mockRequestStream) SendDatagram([]byte) error                       { return nil }
+func (m *mockRequestStream) ReceiveDatagram(context.Context) ([]byte, error) { return nil, nil }
+
+// TestSendFinalBytes_ContinuesOnIndividualStreamError verifies that sendFinalBytes
+// continues processing other streams when one stream encounters an error.
+// This is critical for the Quic-Fin-Sync technique - we want maximum synchronization
+// even if some streams fail.
+func TestSendFinalBytes_ContinuesOnIndividualStreamError(t *testing.T) {
+	// Create 3 mock streams: first fails on write, second succeeds, third fails on close
+	stream1 := &mockRequestStream{writeErr: fmt.Errorf("write error on stream 1")}
+	stream2 := &mockRequestStream{} // Success
+	stream3 := &mockRequestStream{closeErr: fmt.Errorf("close error on stream 3")}
+
+	r := &http3Request{
+		streams: []http3.RequestStream{stream1, stream2, stream3},
+		finalBytes: [][]byte{
+			[]byte("a"), // stream1 has final byte (will fail write)
+			[]byte("b"), // stream2 has final byte (will succeed)
+			nil,         // stream3 has no final byte (will fail close)
+		},
+	}
+
+	// sendFinalBytes should NOT return error because not ALL streams failed
+	err := r.sendFinalBytes()
+	if err != nil {
+		t.Fatalf("sendFinalBytes should not return error when only some streams fail, got: %v", err)
+	}
+
+	// Verify stream1: write failed, but close was still attempted
+	if !stream1.closed {
+		t.Error("stream1 should have been closed even after write failure")
+	}
+
+	// Verify stream2: both write and close succeeded
+	if string(stream2.written) != "b" {
+		t.Errorf("stream2 should have written final byte 'b', got: %q", stream2.written)
+	}
+	if !stream2.closed {
+		t.Error("stream2 should have been closed")
+	}
+
+	// Verify stream3: close was attempted (and failed, but that's tracked)
+	if !stream3.closed {
+		t.Error("stream3.Close() should have been called")
+	}
+}
+
+// TestSendFinalBytes_ReturnsErrorWhenAllStreamsFail verifies that sendFinalBytes
+// returns an error only when ALL streams fail.
+func TestSendFinalBytes_ReturnsErrorWhenAllStreamsFail(t *testing.T) {
+	// Create 3 mock streams that all fail
+	stream1 := &mockRequestStream{closeErr: fmt.Errorf("close error 1")}
+	stream2 := &mockRequestStream{writeErr: fmt.Errorf("write error 2"), closeErr: fmt.Errorf("close error 2")}
+	stream3 := &mockRequestStream{closeErr: fmt.Errorf("close error 3")}
+
+	r := &http3Request{
+		streams: []http3.RequestStream{stream1, stream2, stream3},
+		finalBytes: [][]byte{
+			nil,         // stream1 no final byte
+			[]byte("x"), // stream2 has final byte
+			nil,         // stream3 no final byte
+		},
+	}
+
+	// sendFinalBytes should return error because ALL streams failed
+	err := r.sendFinalBytes()
+	if err == nil {
+		t.Fatal("sendFinalBytes should return error when all streams fail")
+	}
+	if !strings.Contains(err.Error(), "all 3 streams failed") {
+		t.Errorf("error should mention all streams failed, got: %v", err)
+	}
+}
+
+// TestSendFinalBytes_CorrectlyCountsFailedStreams verifies that the failed stream
+// count is based on unique stream indices, not error count.
+// A single stream can have both write and close errors, but should only count once.
+func TestSendFinalBytes_CorrectlyCountsFailedStreams(t *testing.T) {
+	// Create 2 streams: stream1 has BOTH write and close errors
+	// This tests the fix for the bug where len(errors) was used instead of len(failedStreams)
+	stream1 := &mockRequestStream{
+		writeErr: fmt.Errorf("write error"),
+		closeErr: fmt.Errorf("close error"),
+	}
+	stream2 := &mockRequestStream{} // Succeeds
+
+	r := &http3Request{
+		streams: []http3.RequestStream{stream1, stream2},
+		finalBytes: [][]byte{
+			[]byte("x"), // stream1 has final byte (triggers write error)
+			[]byte("y"), // stream2 has final byte (succeeds)
+		},
+	}
+
+	// sendFinalBytes should NOT return error because stream2 succeeded
+	// Even though stream1 has 2 errors, only 1 unique stream failed
+	err := r.sendFinalBytes()
+	if err != nil {
+		t.Fatalf("sendFinalBytes should not error when only 1/2 streams failed (even with multiple errors on that stream), got: %v", err)
+	}
+
+	// Verify stream2 completed successfully
+	if string(stream2.written) != "y" {
+		t.Errorf("stream2 should have written 'y', got: %q", stream2.written)
+	}
+	if !stream2.closed {
+		t.Error("stream2 should have been closed")
+	}
 }

@@ -266,12 +266,74 @@ func cloneRequest(req *http.Request, bodyData []byte) *http.Request {
 // sendFinalBytes implements Phase 2 of the Quic-Fin-Sync technique.
 // It sends the final byte and FIN flag for all streams in rapid succession,
 // triggering simultaneous server-side processing.
+//
+// For each stream:
+//   - Writes the final byte (if any body was present)
+//   - Calls Close() to send the FIN flag
+//
+// All operations happen in a tight loop for maximum synchronization.
+// The goal is to have all FIN frames batched in a single UDP packet.
+//
+// Errors on individual streams are collected but don't stop processing
+// of other streams. This ensures maximum synchronization even if some
+// streams encounter issues.
+//
+// Returns an error only if ALL streams fail. If some streams succeed
+// and some fail, returns nil but logs the failures.
 func (r *http3Request) sendFinalBytes() error {
-	// TODO: Implement final byte synchronization
-	// - Write final byte to each stream
-	// - Call Close() on each stream to set FIN flag
-	// - Ensure all close operations happen rapidly
-	return fmt.Errorf("sendFinalBytes not yet implemented")
+	if len(r.streams) == 0 {
+		return fmt.Errorf("no streams to send final bytes on: call sendPartialRequests first")
+	}
+
+	// Track which streams failed (a single stream can have multiple errors)
+	failedStreams := make(map[int]bool)
+	// Track all errors for logging
+	type streamError struct {
+		index int
+		err   error
+	}
+	var errors []streamError
+
+	// Tight loop to send all final bytes and FINs in rapid succession
+	// This is the critical synchronization point - all close operations
+	// should happen as close together as possible to fit in one UDP packet
+	for i, stream := range r.streams {
+		// Write the final byte if this stream has one
+		if r.finalBytes[i] != nil && len(r.finalBytes[i]) > 0 {
+			if _, err := stream.Write(r.finalBytes[i]); err != nil {
+				failedStreams[i] = true
+				errors = append(errors, streamError{index: i, err: fmt.Errorf("failed to write final byte: %w", err)})
+				// Continue to try closing even if write fails
+			}
+		}
+
+		// Close the stream to send FIN flag
+		// This is the key synchronization - all FINs should go out together
+		if err := stream.Close(); err != nil {
+			failedStreams[i] = true
+			errors = append(errors, streamError{index: i, err: fmt.Errorf("failed to close stream: %w", err)})
+		}
+	}
+
+	// Report results
+	if len(failedStreams) > 0 {
+		// Log individual stream errors
+		for _, se := range errors {
+			log.Printf("Stream %d error during final byte sync: %v", se.index, se.err)
+		}
+
+		// Only return error if ALL streams failed
+		if len(failedStreams) == len(r.streams) {
+			return fmt.Errorf("all %d streams failed during final byte synchronization", len(r.streams))
+		}
+
+		// Some succeeded, some failed - log warning but don't error
+		log.Printf("WARNING: %d/%d streams encountered errors during final byte sync", len(failedStreams), len(r.streams))
+	} else {
+		log.Printf("Sent final bytes and FIN flags on all %d streams", len(r.streams))
+	}
+
+	return nil
 }
 
 // readResponses collects HTTP/3 responses from all streams and
