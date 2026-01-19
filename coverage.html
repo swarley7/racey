@@ -1,0 +1,985 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>racey: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/swarley7/racey/http3_client.go (76.7%)</option>
+				
+				<option value="file1">github.com/swarley7/racey/main.go (0.0%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package main
+
+import (
+        "context"
+        "crypto/tls"
+        "fmt"
+        "net/http"
+        "strings"
+
+        "github.com/quic-go/quic-go"
+        "github.com/quic-go/quic-go/http3"
+)
+
+// http3Request holds the state for an HTTP/3 single packet attack.
+// This mirrors the HTTP/2 request struct but uses QUIC/HTTP/3 types.
+type http3Request struct {
+        Host       string
+        Request    *http.Request
+        conn       quic.Connection
+        clientConn *http3.ClientConn
+        streams    []*http3.RequestStream
+        responses  []*Response
+}
+
+// dialQUIC establishes a QUIC connection to the target host with TLS.
+// It configures ALPN for HTTP/3 ("h3") and returns a connection ready
+// for opening streams.
+//
+// The host parameter should be in "host:port" format. If no port is specified,
+// port 443 is used by default.
+//
+// If tlsConfig is nil, a default configuration is created with:
+//   - ALPN set to "h3" for HTTP/3
+//   - InsecureSkipVerify set to true (matching HTTP/2 behavior)
+//   - ServerName extracted from the host
+//
+// If quicConfig is nil, default QUIC settings are used.
+func dialQUIC(ctx context.Context, host string, tlsConfig *tls.Config, quicConfig *quic.Config) (quic.Connection, error) <span class="cov8" title="1">{
+        // Ensure host has a port
+        address := host
+        if !strings.Contains(host, ":") </span><span class="cov8" title="1">{
+                address = host + ":443"
+        }</span>
+
+        // Extract hostname without port for SNI
+        <span class="cov8" title="1">hostname := strings.Split(address, ":")[0]
+
+        // Create default TLS config if not provided
+        if tlsConfig == nil </span><span class="cov8" title="1">{
+                tlsConfig = &amp;tls.Config{
+                        ServerName:         hostname,
+                        NextProtos:         []string{"h3"}, // ALPN for HTTP/3
+                        InsecureSkipVerify: true,           // Match HTTP/2 behavior
+                }
+        }</span> else<span class="cov8" title="1"> {
+                // Ensure ALPN includes "h3" for HTTP/3
+                hasH3 := false
+                for _, proto := range tlsConfig.NextProtos </span><span class="cov8" title="1">{
+                        if proto == "h3" </span><span class="cov8" title="1">{
+                                hasH3 = true
+                                break</span>
+                        }
+                }
+                <span class="cov8" title="1">if !hasH3 </span><span class="cov8" title="1">{
+                        tlsConfig.NextProtos = append([]string{"h3"}, tlsConfig.NextProtos...)
+                }</span>
+
+                // Set ServerName if not already set
+                <span class="cov8" title="1">if tlsConfig.ServerName == "" </span><span class="cov8" title="1">{
+                        tlsConfig.ServerName = hostname
+                }</span>
+        }
+
+        // Dial the QUIC connection
+        <span class="cov8" title="1">conn, err := quic.DialAddr(ctx, address, tlsConfig, quicConfig)
+        if err != nil </span><span class="cov8" title="1">{
+                // Provide clear error messages for common failure scenarios
+                if strings.Contains(err.Error(), "no recent network activity") </span><span class="cov0" title="0">{
+                        return nil, fmt.Errorf("HTTP/3 connection to %s timed out: %w", address, err)
+                }</span>
+                <span class="cov8" title="1">if strings.Contains(err.Error(), "connection refused") </span><span class="cov0" title="0">{
+                        return nil, fmt.Errorf("HTTP/3 connection refused by %s (server may not support HTTP/3 on UDP/443): %w", address, err)
+                }</span>
+                <span class="cov8" title="1">if strings.Contains(err.Error(), "network is unreachable") </span><span class="cov0" title="0">{
+                        return nil, fmt.Errorf("cannot reach %s (UDP may be blocked by firewall): %w", address, err)
+                }</span>
+                <span class="cov8" title="1">if strings.Contains(err.Error(), "TLS") || strings.Contains(err.Error(), "tls") </span><span class="cov0" title="0">{
+                        return nil, fmt.Errorf("TLS handshake failed with %s: %w", address, err)
+                }</span>
+                <span class="cov8" title="1">return nil, fmt.Errorf("failed to establish HTTP/3 connection to %s: %w", address, err)</span>
+        }
+
+        <span class="cov8" title="1">return conn, nil</span>
+}
+
+// sendPartialRequests implements Phase 1 of the Quic-Fin-Sync technique.
+// It opens multiple QUIC streams, sends HEADERS frames for each request,
+// but withholds the final byte/FIN flag to keep requests incomplete.
+func (r *http3Request) sendPartialRequests(ctx context.Context, count int) error <span class="cov0" title="0">{
+        // TODO: Implement partial request sending
+        // - Use clientConn.OpenRequestStream() for each request
+        // - Send request headers via SendRequestHeader()
+        // - Write request body (if any) minus final byte
+        // - Store streams for later FIN synchronization
+        return fmt.Errorf("sendPartialRequests not yet implemented")
+}</span>
+
+// sendFinalBytes implements Phase 2 of the Quic-Fin-Sync technique.
+// It sends the final byte and FIN flag for all streams in rapid succession,
+// triggering simultaneous server-side processing.
+func (r *http3Request) sendFinalBytes() error <span class="cov0" title="0">{
+        // TODO: Implement final byte synchronization
+        // - Write final byte to each stream
+        // - Call Close() on each stream to set FIN flag
+        // - Ensure all close operations happen rapidly
+        return fmt.Errorf("sendFinalBytes not yet implemented")
+}</span>
+
+// readResponses collects HTTP/3 responses from all streams and
+// converts them to the shared Response struct for analysis.
+func (r *http3Request) readResponses() (map[uint32]*Response, error) <span class="cov0" title="0">{
+        // TODO: Implement response collection
+        // - Call ReadResponse() on each RequestStream
+        // - Parse response headers and body
+        // - Convert to Response struct (shared with HTTP/2)
+        return nil, fmt.Errorf("readResponses not yet implemented")
+}</span>
+</pre>
+		
+		<pre class="file" id="file1" style="display: none">package main
+
+import (
+        "bufio"
+        "bytes"
+        "crypto/tls"
+        "flag"
+        "fmt"
+        "io"
+        "log"
+        "net"
+        "net/http"
+        "os"
+        "strings"
+        "sync"
+        "time"
+
+        probing "github.com/prometheus-community/pro-bing"
+        "golang.org/x/net/http2"
+        "golang.org/x/net/http2/hpack"
+)
+
+type request struct {
+        Host        string
+        Request     *http.Request
+        framer      *http2.Framer
+        streamID    uint32
+        hbuf        bytes.Buffer
+        henc        *hpack.Encoder
+        peerSetting map[http2.SettingID]uint32
+        hdec        *hpack.Decoder
+        // Track current stream's headers being decoded
+        currentStreamID uint32
+        streamHeaders   map[uint32]map[string]string
+}
+
+// Response holds a collected HTTP/2 response
+type Response struct {
+        StreamID uint32
+        Status   string
+        Headers  map[string]string
+        Body     []byte
+        Error    string
+}
+
+/*
+First, pre-send the bulk of each request:
+
+If the request has no body, send all the headers, but don't set the END_STREAM flag. Withhold an empty data frame with END_STREAM set.
+If the request has a body, send the headers and all the body data except the final byte. Withhold a data frame containing the final byte.
+You might be tempted to send the full body and rely on not sending END_STREAM, but this will break on certain HTTP/2 server implementations that use the content-length header to decide when a message is complete, as opposed to waiting for END_STREAM.
+
+Next, prepare to send the final frames:
+
+Wait for 100ms to ensure the initial frames have been sent.
+Ensure TCP_NODELAY is disabled - it's crucial that Nagle's algorithm batches the final frames.
+Send a ping packet to warm the local connection. If you don't do this, the OS network stack will place the first final-frame in a separate packet.
+*/
+
+func gateRequests(wg sync.WaitGroup, client *http.Client, reqs chan request, proceed chan struct{}) <span class="cov0" title="0">{
+        // Wait for everything to be ready
+        gatedReqs := make(chan request)
+        for req := range reqs </span><span class="cov0" title="0">{
+                // Logic to do partial request here
+                httpReq := req.Request
+                if httpReq.ContentLength == 0 </span>{<span class="cov0" title="0">
+
+                }</span> // Only headers here
+                <span class="cov0" title="0">client.Do(httpReq)</span>
+        }
+        <span class="cov0" title="0">select </span>{
+        case &lt;-proceed:<span class="cov0" title="0">
+                break</span>
+        }
+        // wg.Add(1)
+        <span class="cov0" title="0">go buildFinal(wg, gatedReqs)
+        wg.Done()</span>
+}
+
+func buildFinal(wg sync.WaitGroup, gatedReqs chan request) {<span class="cov0" title="0">
+
+}</span>
+
+func doDelay(delay time.Duration) <span class="cov0" title="0">{
+        time.Sleep(delay)
+        return
+}</span>
+
+func ping(address string) (err error) <span class="cov0" title="0">{
+        err = nil
+        pinger, err := probing.NewPinger(address)
+        if err != nil </span><span class="cov0" title="0">{
+                panic(err)</span>
+        }
+        <span class="cov0" title="0">pinger.Count = 1
+        err = pinger.Run() // Blocks until finished.
+        if err != nil </span><span class="cov0" title="0">{
+                panic(err)</span>
+        }
+        <span class="cov0" title="0">return err</span>
+}
+
+// parseBurpHeaders parses headers copied from Burp Suite
+// Format: "Header-Name: value" separated by newlines
+// Handles both \n and \r\n line endings
+func parseBurpHeaders(headerStr string) http.Header <span class="cov0" title="0">{
+        headers := make(http.Header)
+        if headerStr == "" </span><span class="cov0" title="0">{
+                return headers
+        }</span>
+
+        // Normalize line endings and split
+        <span class="cov0" title="0">headerStr = strings.ReplaceAll(headerStr, "\r\n", "\n")
+        lines := strings.Split(headerStr, "\n")
+
+        for _, line := range lines </span><span class="cov0" title="0">{
+                line = strings.TrimSpace(line)
+                if line == "" </span><span class="cov0" title="0">{
+                        continue</span>
+                }
+
+                // Split on first colon only (header values can contain colons)
+                <span class="cov0" title="0">colonIdx := strings.Index(line, ":")
+                if colonIdx == -1 </span><span class="cov0" title="0">{
+                        log.Printf("Warning: skipping malformed header line: %q", line)
+                        continue</span>
+                }
+
+                <span class="cov0" title="0">name := strings.TrimSpace(line[:colonIdx])
+                value := strings.TrimSpace(line[colonIdx+1:])
+
+                if name == "" </span><span class="cov0" title="0">{
+                        continue</span>
+                }
+
+                <span class="cov0" title="0">headers.Add(name, value)</span>
+        }
+
+        <span class="cov0" title="0">return headers</span>
+}
+
+// applyHeaders merges parsed headers into an existing request
+// Overwrites existing headers with the same name
+func applyHeaders(req *http.Request, headers http.Header) <span class="cov0" title="0">{
+        for name, values := range headers </span><span class="cov0" title="0">{
+                // Delete existing header first to overwrite
+                req.Header.Del(name)
+                for _, v := range values </span><span class="cov0" title="0">{
+                        req.Header.Add(name, v)
+                }</span>
+        }
+}
+
+func main() <span class="cov0" title="0">{
+        var Url, headers, requestFile, method, logFile string
+        var count int
+        var delay int64
+        var debug, prettify bool
+        flag.StringVar(&amp;Url, "url", "https://localhost:8000", "Target URL")
+        flag.StringVar(&amp;method, "method", "GET", "HTTP Method")
+
+        flag.StringVar(&amp;headers, "headers", "", "HTTP headers to include (copy paste from Burp)")
+        flag.StringVar(&amp;requestFile, "request", "", "A file containing a HTTP request to load")
+        flag.IntVar(&amp;count, "count", 1, "Number of requests to send")
+        flag.Int64Var(&amp;delay, "delay", 1000, "Delay before sending final frames")
+        flag.BoolVar(&amp;debug, "debug", false, "Enable http2 debugging, log TLS keys for interception")
+        flag.BoolVar(&amp;prettify, "prettify", true, "Prettify the output of HTTP2 responses")
+        flag.StringVar(&amp;logFile, "log", "", "Log file path for full untruncated response analysis")
+
+        flag.Parse()
+
+        // Setup log file if specified
+        var logWriter *os.File
+        if logFile != "" </span><span class="cov0" title="0">{
+                var err error
+                logWriter, err = os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+                if err != nil </span><span class="cov0" title="0">{
+                        log.Fatalf("Failed to open log file: %v", err)
+                }</span>
+                <span class="cov0" title="0">defer logWriter.Close()
+                fmt.Fprintf(logWriter, "\n%s\n", strings.Repeat("=", 80))
+                fmt.Fprintf(logWriter, "RACEY LOG - %s\n", time.Now().Format(time.RFC3339))
+                fmt.Fprintf(logWriter, "%s\n", strings.Repeat("=", 80))
+                fmt.Fprintf(logWriter, "\nINPUT PARAMETERS:\n")
+                fmt.Fprintf(logWriter, "  URL: %s\n", Url)
+                fmt.Fprintf(logWriter, "  Method: %s\n", method)
+                fmt.Fprintf(logWriter, "  Count: %d\n", count)
+                fmt.Fprintf(logWriter, "  Delay: %d ms\n", delay)
+                if requestFile != "" </span><span class="cov0" title="0">{
+                        fmt.Fprintf(logWriter, "  Request File: %s\n", requestFile)
+                        // Include the raw request file contents
+                        if reqFileContents, err := os.ReadFile(requestFile); err == nil </span><span class="cov0" title="0">{
+                                fmt.Fprintf(logWriter, "\nRAW REQUEST FILE CONTENTS:\n")
+                                fmt.Fprintf(logWriter, "%s\n", strings.Repeat("-", 40))
+                                fmt.Fprintf(logWriter, "%s\n", string(reqFileContents))
+                                fmt.Fprintf(logWriter, "%s\n", strings.Repeat("-", 40))
+                        }</span>
+                }
+                <span class="cov0" title="0">if headers != "" </span><span class="cov0" title="0">{
+                        fmt.Fprintf(logWriter, "  Custom Headers:\n")
+                        for _, line := range strings.Split(headers, "\n") </span><span class="cov0" title="0">{
+                                line = strings.TrimSpace(line)
+                                if line != "" </span><span class="cov0" title="0">{
+                                        fmt.Fprintf(logWriter, "    %s\n", line)
+                                }</span>
+                        }
+                }
+                <span class="cov0" title="0">fmt.Fprintf(logWriter, "\nCOMMAND LINE (for repeatability):\n")
+                fmt.Fprintf(logWriter, "  go run main.go -url %q -method %s -count %d -delay %d",
+                        Url, method, count, delay)
+                if requestFile != "" </span><span class="cov0" title="0">{
+                        fmt.Fprintf(logWriter, " -request %q", requestFile)
+                }</span>
+                <span class="cov0" title="0">if headers != "" </span><span class="cov0" title="0">{
+                        fmt.Fprintf(logWriter, " -headers %q", headers)
+                }</span>
+                <span class="cov0" title="0">if debug </span><span class="cov0" title="0">{
+                        fmt.Fprintf(logWriter, " -debug")
+                }</span>
+                <span class="cov0" title="0">fmt.Fprintf(logWriter, "\n")</span>
+        }
+
+        //Wrap this in a method and loop
+        /* here*/
+        <span class="cov0" title="0">var err error
+        var req *http.Request
+        if requestFile != "" </span><span class="cov0" title="0">{
+                req, err = ReadRequest(requestFile)
+        }</span> else<span class="cov0" title="0"> {
+                req, err = http.NewRequest(method, Url, nil)
+        }</span>
+        <span class="cov0" title="0">if err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("err %v", err)
+        }</span>
+
+        // Apply custom headers from -headers flag (Burp format)
+        <span class="cov0" title="0">if headers != "" </span><span class="cov0" title="0">{
+                customHeaders := parseBurpHeaders(headers)
+                applyHeaders(req, customHeaders)
+                if debug </span><span class="cov0" title="0">{
+                        log.Printf("Applied %d custom header(s)", len(customHeaders))
+                }</span>
+        }
+
+        <span class="cov0" title="0">host := req.Host
+        if !strings.Contains(host, ":") </span><span class="cov0" title="0">{
+                host += ":443" //add port
+        }</span>
+        <span class="cov0" title="0">app := &amp;request{Host: host, peerSetting: make(map[http2.SettingID]uint32)}
+        app.henc = hpack.NewEncoder(&amp;app.hbuf)
+
+        cfg := &amp;tls.Config{
+                ServerName:         strings.Split(app.Host, ":")[0], // SNI must not include port
+                NextProtos:         strings.Split("h2,h2-14", ","),
+                InsecureSkipVerify: true,
+        }
+        if debug </span><span class="cov0" title="0">{
+                f, err := os.OpenFile("/tmp/keys", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+                if err != nil </span><span class="cov0" title="0">{
+                        panic(err)</span>
+                }
+                <span class="cov0" title="0">cfg.KeyLogWriter = f</span>
+        }
+        <span class="cov0" title="0">hostAndPort := app.Host
+        log.Printf("Connecting to %s ...", hostAndPort)
+        tcpAddr, _ := net.ResolveTCPAddr("tcp4", hostAndPort)
+
+        conn, err := net.DialTCP("tcp4", nil, tcpAddr)
+        if err != nil </span><span class="cov0" title="0">{
+                panic(err)</span>
+        }
+        <span class="cov0" title="0">conn.SetNoDelay(false)
+        tc := tls.Client(conn, cfg)
+        log.Printf("Connected to %v", tc.RemoteAddr())
+        defer tc.Close()
+
+        if err := tc.Handshake(); err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("TLS handshake: %v", err)
+        }</span>
+        <span class="cov0" title="0">state := tc.ConnectionState()
+        log.Printf("Negotiated protocol %q", state.NegotiatedProtocol)
+        if state.NegotiatedProtocol == "" </span><span class="cov0" title="0">{
+                log.Fatalf("Could not negotiate protocol mutually")
+        }</span>
+        <span class="cov0" title="0">if _, err := io.WriteString(tc, http2.ClientPreface); err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("err %v", err)
+        }</span>
+        <span class="cov0" title="0">app.framer = http2.NewFramer(tc, tc)
+        // testing
+
+        hbf := app.encodeHeaders(req)
+        for i := 1; i &lt;= count*2; i += 2 </span><span class="cov0" title="0">{
+                app.streamID = uint32(i)
+                // log.Println(hbf)
+                log.Printf("Opening Stream-ID %d:\n", app.streamID)
+                var settings []http2.Setting // TODO figure out if there's any benefit to modifying settings?
+                app.framer.WriteSettings(settings...)
+                app.framer.WriteHeaders(http2.HeadersFrameParam{
+                        StreamID:      app.streamID,
+                        BlockFragment: hbf,
+                        EndStream:     false, // good enough for now
+                        EndHeaders:    true,  // for now
+                })
+
+        }</span>
+        <span class="cov0" title="0">log.Printf("Sent initial frames, waiting")
+
+        doDelay(time.Duration(delay) * time.Millisecond)
+        // var data [8]byte
+
+        // copy(data[:], "lol_ping")
+        log.Printf("Pinging host: %v", host)
+        ping(strings.Split(host, ":")[0])
+        for i := 1; i &lt;= count*2; i += 2 </span><span class="cov0" title="0">{
+                app.streamID = uint32(i)
+                app.framer.WriteData(app.streamID, true, []byte{})
+        }</span>
+        // time.Sleep(1000 * time.Millisecond)
+        <span class="cov0" title="0">type result struct {
+                responses map[uint32]*Response
+                err       error
+        }
+        resultc := make(chan result, 1)
+        go func() </span><span class="cov0" title="0">{
+                responses, err := app.readFrames(count)
+                resultc &lt;- result{responses, err}
+        }</span>()
+        <span class="cov0" title="0">res := &lt;-resultc
+        if res.err != nil </span><span class="cov0" title="0">{
+                log.Printf("Finished with error: %v", res.err)
+        }</span> else<span class="cov0" title="0"> {
+                log.Printf("Completed successfully")
+                analyzeResponses(res.responses, logWriter)
+        }</span>
+}
+
+func (app *request) compileResponse() (string, error) <span class="cov0" title="0">{
+
+        return "", nil
+}</span>
+
+func ReadRequest(filename string) (req *http.Request, err error) <span class="cov0" title="0">{
+        log.Printf("Loading file: %v\n", filename)
+
+        f, err := os.Open(filename)
+
+        if err != nil </span><span class="cov0" title="0">{
+                log.Printf("Error: %v\n", err)
+                return nil, err
+        }</span>
+        <span class="cov0" title="0">rawReq := bufio.NewReader(f)
+        req, err = http.ReadRequest(rawReq)
+        if err != nil </span><span class="cov0" title="0">{
+                log.Printf("Error: %v\n", err)
+                return nil, err
+        }</span>
+        <span class="cov0" title="0">return req, err</span>
+}
+
+func (app *request) encodeHeaders(req *http.Request) []byte <span class="cov0" title="0">{
+        app.hbuf.Reset()
+
+        host := req.Host
+        if host == "" </span><span class="cov0" title="0">{
+                host = req.URL.Host
+        }</span>
+
+        <span class="cov0" title="0">path := req.URL.Path
+        if path == "" </span><span class="cov0" title="0">{
+                path = "/"
+        }</span>
+        // Include query string in :path if present
+        <span class="cov0" title="0">if req.URL.RawQuery != "" </span><span class="cov0" title="0">{
+                path = path + "?" + req.URL.RawQuery
+        }</span>
+
+        <span class="cov0" title="0">app.writeHeader(":authority", host)
+        app.writeHeader(":method", req.Method)
+        app.writeHeader(":path", path)
+        app.writeHeader(":scheme", "https")
+
+        for k, vv := range req.Header </span><span class="cov0" title="0">{
+                lowKey := strings.ToLower(k)
+                if lowKey == "host" </span><span class="cov0" title="0">{
+                        continue</span>
+                }
+                <span class="cov0" title="0">for _, v := range vv </span><span class="cov0" title="0">{
+                        app.writeHeader(lowKey, v)
+                }</span>
+        }
+        <span class="cov0" title="0">return app.hbuf.Bytes()</span>
+}
+
+func (app *request) writeHeader(name, value string) <span class="cov0" title="0">{
+        app.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
+}</span>
+
+func (app *request) logf(format string, args ...interface{}) <span class="cov0" title="0">{
+        log.Printf(format+"\r\n", args...)
+}</span>
+
+func (app *request) readFrames(expectedStreams int) (map[uint32]*Response, error) <span class="cov0" title="0">{
+        responses := make(map[uint32]*Response)
+        bodyBuffers := make(map[uint32]*bytes.Buffer)
+        completedStreams := make(map[uint32]bool)
+
+        // Initialize streamHeaders map
+        app.streamHeaders = make(map[uint32]map[string]string)
+
+        for </span><span class="cov0" title="0">{
+                f, err := app.framer.ReadFrame()
+                if err != nil </span><span class="cov0" title="0">{
+                        if err == io.EOF </span><span class="cov0" title="0">{
+                                app.logf("Connection closed by server")
+                                return responses, nil
+                        }</span>
+                        <span class="cov0" title="0">return responses, fmt.Errorf("ReadFrame: %v", err)</span>
+                }
+                <span class="cov0" title="0">app.logf("%v", f)
+
+                // Check for stream completion via END_STREAM flag
+                streamEnded := false
+                var streamID uint32
+
+                switch f := f.(type) </span>{
+                case *http2.PingFrame:<span class="cov0" title="0">
+                        app.logf("  Data = %q", f.Data)</span>
+                case *http2.SettingsFrame:<span class="cov0" title="0">
+                        f.ForeachSetting(func(s http2.Setting) error </span><span class="cov0" title="0">{
+                                app.logf("  %v", s)
+                                app.peerSetting[s.ID] = s.Val
+                                return nil
+                        }</span>)
+                case *http2.WindowUpdateFrame:<span class="cov0" title="0">
+                        app.logf("  Window-Increment = %v", f.Increment)</span>
+                case *http2.GoAwayFrame:<span class="cov0" title="0">
+                        app.logf("  Last-Stream-ID = %d; Error-Code = %v (%d)", f.LastStreamID, f.ErrCode, f.ErrCode)
+                        return responses, nil</span>
+                case *http2.DataFrame:<span class="cov0" title="0">
+                        app.logf("  %q", f.Data())
+                        streamID = f.StreamID
+                        // Accumulate body data
+                        if bodyBuffers[streamID] == nil </span><span class="cov0" title="0">{
+                                bodyBuffers[streamID] = &amp;bytes.Buffer{}
+                        }</span>
+                        <span class="cov0" title="0">bodyBuffers[streamID].Write(f.Data())
+                        streamEnded = f.StreamEnded()</span>
+                case *http2.HeadersFrame:<span class="cov0" title="0">
+                        streamID = f.StreamID
+                        if f.HasPriority() </span><span class="cov0" title="0">{
+                                app.logf("  PRIORITY = %v", f.Priority)
+                        }</span>
+                        <span class="cov0" title="0">if app.hdec == nil </span><span class="cov0" title="0">{
+                                tableSize := uint32(4 &lt;&lt; 10)
+                                app.hdec = hpack.NewDecoder(tableSize, app.onNewHeaderField)
+                        }</span>
+                        // Initialize headers map for this stream
+                        <span class="cov0" title="0">if app.streamHeaders[streamID] == nil </span><span class="cov0" title="0">{
+                                app.streamHeaders[streamID] = make(map[string]string)
+                        }</span>
+                        <span class="cov0" title="0">app.currentStreamID = streamID
+                        app.hdec.Write(f.HeaderBlockFragment())
+                        streamEnded = f.StreamEnded()</span>
+                case *http2.RSTStreamFrame:<span class="cov0" title="0">
+                        app.logf("  %q - [%d]", f.ErrCode.String(), f.StreamID)
+                        streamID = f.StreamID
+                        // Create error response
+                        if responses[streamID] == nil </span><span class="cov0" title="0">{
+                                responses[streamID] = &amp;Response{StreamID: streamID}
+                        }</span>
+                        <span class="cov0" title="0">responses[streamID].Error = f.ErrCode.String()
+                        completedStreams[streamID] = true</span>
+                case *http2.PushPromiseFrame:<span class="cov0" title="0">
+                        if app.hdec == nil </span><span class="cov0" title="0">{
+                                tableSize := uint32(4 &lt;&lt; 10)
+                                app.hdec = hpack.NewDecoder(tableSize, app.onNewHeaderField)
+                        }</span>
+                        <span class="cov0" title="0">app.hdec.Write(f.HeaderBlockFragment())</span>
+                }
+
+                // Mark stream as completed if END_STREAM was set
+                <span class="cov0" title="0">if streamEnded &amp;&amp; streamID &gt; 0 </span><span class="cov0" title="0">{
+                        completedStreams[streamID] = true
+                        app.logf("Stream %d completed (END_STREAM)", streamID)
+
+                        // Build the response object
+                        resp := &amp;Response{
+                                StreamID: streamID,
+                                Headers:  app.streamHeaders[streamID],
+                        }
+                        if resp.Headers != nil </span><span class="cov0" title="0">{
+                                resp.Status = resp.Headers[":status"]
+                        }</span>
+                        <span class="cov0" title="0">if bodyBuffers[streamID] != nil </span><span class="cov0" title="0">{
+                                resp.Body = bodyBuffers[streamID].Bytes()
+                        }</span>
+                        <span class="cov0" title="0">responses[streamID] = resp</span>
+                }
+
+                // Check if all expected streams are done
+                <span class="cov0" title="0">if len(completedStreams) &gt;= expectedStreams </span><span class="cov0" title="0">{
+                        app.logf("All %d streams completed", expectedStreams)
+                        return responses, nil
+                }</span>
+        }
+}
+
+func (app *request) onNewHeaderField(f hpack.HeaderField) <span class="cov0" title="0">{
+        if f.Sensitive </span><span class="cov0" title="0">{
+                app.logf("  %s = %q (SENSITIVE)", f.Name, f.Value)
+        }</span>
+        <span class="cov0" title="0">app.logf("  %s = %q", f.Name, f.Value)
+
+        // Store header in the current stream's headers map
+        if app.streamHeaders != nil &amp;&amp; app.currentStreamID &gt; 0 </span><span class="cov0" title="0">{
+                if app.streamHeaders[app.currentStreamID] == nil </span><span class="cov0" title="0">{
+                        app.streamHeaders[app.currentStreamID] = make(map[string]string)
+                }</span>
+                <span class="cov0" title="0">app.streamHeaders[app.currentStreamID][f.Name] = f.Value</span>
+        }
+}
+
+// analyzeResponses compares all responses and reports variations
+// If logWriter is provided, writes full untruncated output to it
+func analyzeResponses(responses map[uint32]*Response, logWriter *os.File) <span class="cov0" title="0">{
+        // Helper to write to both stdout and log file
+        output := func(format string, args ...interface{}) </span><span class="cov0" title="0">{
+                fmt.Printf(format, args...)
+                if logWriter != nil </span><span class="cov0" title="0">{
+                        fmt.Fprintf(logWriter, format, args...)
+                }</span>
+        }
+
+        // Helper to write only to log file (for full untruncated data)
+        <span class="cov0" title="0">logOnly := func(format string, args ...interface{}) </span><span class="cov0" title="0">{
+                if logWriter != nil </span><span class="cov0" title="0">{
+                        fmt.Fprintf(logWriter, format, args...)
+                }</span>
+        }
+
+        <span class="cov0" title="0">if len(responses) == 0 </span><span class="cov0" title="0">{
+                output("\n" + strings.Repeat("=", 60) + "\n")
+                output("NO RESPONSES RECEIVED\n")
+                output(strings.Repeat("=", 60) + "\n")
+                return
+        }</span>
+
+        <span class="cov0" title="0">output("\n" + strings.Repeat("=", 60) + "\n")
+        output("RESPONSE ANALYSIS\n")
+        output(strings.Repeat("=", 60) + "\n")
+
+        // Group responses by status code
+        statusGroups := make(map[string][]uint32)
+        // Group responses by body content
+        bodyGroups := make(map[string][]uint32)
+        // Group responses by body length
+        lengthGroups := make(map[int][]uint32)
+        // Track all header names and their values across streams
+        headerValues := make(map[string]map[string][]uint32) // header -&gt; value -&gt; streams
+
+        for streamID, resp := range responses </span><span class="cov0" title="0">{
+                if resp.Error != "" </span><span class="cov0" title="0">{
+                        statusGroups["ERROR:"+resp.Error] = append(statusGroups["ERROR:"+resp.Error], streamID)
+                        continue</span>
+                }
+
+                <span class="cov0" title="0">status := resp.Status
+                if status == "" </span><span class="cov0" title="0">{
+                        status = "UNKNOWN"
+                }</span>
+                <span class="cov0" title="0">statusGroups[status] = append(statusGroups[status], streamID)
+
+                bodyStr := string(resp.Body)
+                bodyGroups[bodyStr] = append(bodyGroups[bodyStr], streamID)
+
+                lengthGroups[len(resp.Body)] = append(lengthGroups[len(resp.Body)], streamID)
+
+                // Collect header values
+                for headerName, headerValue := range resp.Headers </span><span class="cov0" title="0">{
+                        if headerValues[headerName] == nil </span><span class="cov0" title="0">{
+                                headerValues[headerName] = make(map[string][]uint32)
+                        }</span>
+                        <span class="cov0" title="0">headerValues[headerName][headerValue] = append(headerValues[headerName][headerValue], streamID)</span>
+                }
+        }
+
+        // Report status code distribution
+        <span class="cov0" title="0">output("\n📊 Status Code Distribution:\n")
+        for status, streams := range statusGroups </span><span class="cov0" title="0">{
+                output("   [%s] × %d (streams: %v)\n", status, len(streams), streams)
+        }</span>
+
+        // Report body length distribution
+        <span class="cov0" title="0">output("\n📏 Response Length Distribution:\n")
+        for length, streams := range lengthGroups </span><span class="cov0" title="0">{
+                output("   [%d bytes] × %d (streams: %v)\n", length, len(streams), streams)
+        }</span>
+
+        // Find headers that vary
+        <span class="cov0" title="0">varyingHeaders := make(map[string]map[string][]uint32)
+        for headerName, values := range headerValues </span><span class="cov0" title="0">{
+                if len(values) &gt; 1 </span><span class="cov0" title="0">{
+                        varyingHeaders[headerName] = values
+                }</span>
+        }
+
+        // Report header variations
+        <span class="cov0" title="0">totalResponses := len(responses)
+        if len(varyingHeaders) &gt; 0 </span><span class="cov0" title="0">{
+                output("\n🔀 Varying Headers:\n")
+                for headerName, values := range varyingHeaders </span><span class="cov0" title="0">{
+                        // Count total streams that have this header
+                        streamsWithHeader := 0
+                        for _, streams := range values </span><span class="cov0" title="0">{
+                                streamsWithHeader += len(streams)
+                        }</span>
+                        <span class="cov0" title="0">uniqueValues := len(values)
+                        output("   %s (%d unique in %d/%d responses):\n", headerName, uniqueValues, streamsWithHeader, totalResponses)
+                        for value, streams := range values </span><span class="cov0" title="0">{
+                                // Truncated for stdout
+                                displayValue := value
+                                if len(displayValue) &gt; 60 </span><span class="cov0" title="0">{
+                                        displayValue = displayValue[:60] + "..."
+                                }</span>
+                                <span class="cov0" title="0">fmt.Printf("      [%s] × %d (streams: %v)\n", displayValue, len(streams), streams)
+                                // Full value for log file
+                                if logWriter != nil </span><span class="cov0" title="0">{
+                                        fmt.Fprintf(logWriter, "      [%s] × %d (streams: %v)\n", value, len(streams), streams)
+                                }</span>
+                        }
+                }
+        } else<span class="cov0" title="0"> {
+                output("\n🔒 Headers: All identical across responses\n")
+        }</span>
+
+        // Determine if responses vary
+        <span class="cov0" title="0">output("\n" + strings.Repeat("-", 60) + "\n")
+
+        statusVaries := len(statusGroups) &gt; 1
+        bodyVaries := len(bodyGroups) &gt; 1
+        headersVary := len(varyingHeaders) &gt; 0
+
+        if !statusVaries &amp;&amp; !bodyVaries &amp;&amp; !headersVary </span><span class="cov0" title="0">{
+                output("✅ ALL RESPONSES IDENTICAL\n")
+                output("   Status: %s | Body Length: %d bytes\n",
+                        responses[getFirstKey(responses)].Status,
+                        len(responses[getFirstKey(responses)].Body))
+        }</span> else<span class="cov0" title="0"> {
+                output("⚠️  RESPONSES VARY!\n")
+
+                if statusVaries </span><span class="cov0" title="0">{
+                        output("   ↳ Status codes differ\n")
+                }</span>
+                <span class="cov0" title="0">if headersVary </span><span class="cov0" title="0">{
+                        output("   ↳ %d header(s) differ: %s\n", len(varyingHeaders), getHeaderNames(varyingHeaders))
+                }</span>
+                <span class="cov0" title="0">if bodyVaries </span><span class="cov0" title="0">{
+                        output("   ↳ Response bodies differ\n")
+                        output("   ↳ %d unique response(s) detected\n", len(bodyGroups))
+                }</span>
+
+                // Show unique responses
+                <span class="cov0" title="0">output("\n📝 Unique Responses:\n")
+                shown := make(map[string]bool)
+                i := 1
+                for streamID, resp := range responses </span><span class="cov0" title="0">{
+                        bodyKey := string(resp.Body)
+                        if shown[bodyKey] </span><span class="cov0" title="0">{
+                                continue</span>
+                        }
+                        <span class="cov0" title="0">shown[bodyKey] = true
+
+                        output("\n   Response #%d (Stream %d):\n", i, streamID)
+                        output("   Status: %s\n", resp.Status)
+
+                        // Show varying headers for this response
+                        if headersVary </span><span class="cov0" title="0">{
+                                output("   Varying Headers:\n")
+                                for headerName := range varyingHeaders </span><span class="cov0" title="0">{
+                                        if val, ok := resp.Headers[headerName]; ok </span><span class="cov0" title="0">{
+                                                // Truncated for stdout
+                                                displayVal := val
+                                                if len(displayVal) &gt; 50 </span><span class="cov0" title="0">{
+                                                        displayVal = displayVal[:50] + "..."
+                                                }</span>
+                                                <span class="cov0" title="0">fmt.Printf("      %s: %s\n", headerName, displayVal)
+                                                // Full value for log file
+                                                if logWriter != nil </span><span class="cov0" title="0">{
+                                                        fmt.Fprintf(logWriter, "      %s: %s\n", headerName, val)
+                                                }</span>
+                                        }
+                                }
+                        }
+
+                        <span class="cov0" title="0">output("   Body Length: %d bytes\n", len(resp.Body))
+
+                        // Show truncated body preview for stdout
+                        bodyPreview := string(resp.Body)
+                        if len(bodyPreview) &gt; 200 </span><span class="cov0" title="0">{
+                                fmt.Printf("   Body Preview:\n   %s...\n", strings.ReplaceAll(bodyPreview[:200], "\n", "\n   "))
+                        }</span> else<span class="cov0" title="0"> if bodyPreview != "" </span><span class="cov0" title="0">{
+                                fmt.Printf("   Body Preview:\n   %s\n", strings.ReplaceAll(bodyPreview, "\n", "\n   "))
+                        }</span>
+
+                        // Full body for log file
+                        <span class="cov0" title="0">if logWriter != nil </span><span class="cov0" title="0">{
+                                fmt.Fprintf(logWriter, "   Full Body:\n   %s\n", strings.ReplaceAll(string(resp.Body), "\n", "\n   "))
+                        }</span>
+
+                        <span class="cov0" title="0">i++</span>
+                }
+        }
+
+        <span class="cov0" title="0">output("\n" + strings.Repeat("=", 60) + "\n")
+
+        // Write full response details to log file
+        if logWriter != nil </span><span class="cov0" title="0">{
+                logOnly("\n" + strings.Repeat("=", 80) + "\n")
+                logOnly("FULL RESPONSE DETAILS\n")
+                logOnly(strings.Repeat("=", 80) + "\n")
+
+                for streamID, resp := range responses </span><span class="cov0" title="0">{
+                        logOnly("\n--- Stream %d ---\n", streamID)
+                        logOnly("Status: %s\n", resp.Status)
+                        if resp.Error != "" </span><span class="cov0" title="0">{
+                                logOnly("Error: %s\n", resp.Error)
+                        }</span>
+                        <span class="cov0" title="0">logOnly("\nHeaders:\n")
+                        for name, value := range resp.Headers </span><span class="cov0" title="0">{
+                                logOnly("   %s: %s\n", name, value)
+                        }</span>
+                        <span class="cov0" title="0">logOnly("\nBody (%d bytes):\n%s\n", len(resp.Body), string(resp.Body))
+                        logOnly(strings.Repeat("-", 40) + "\n")</span>
+                }
+        }
+}
+
+func getFirstKey(m map[uint32]*Response) uint32 <span class="cov0" title="0">{
+        for k := range m </span><span class="cov0" title="0">{
+                return k
+        }</span>
+        <span class="cov0" title="0">return 0</span>
+}
+
+func getHeaderNames(headers map[string]map[string][]uint32) string <span class="cov0" title="0">{
+        names := make([]string, 0, len(headers))
+        for name := range headers </span><span class="cov0" title="0">{
+                names = append(names, name)
+        }</span>
+        <span class="cov0" title="0">return strings.Join(names, ", ")</span>
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>
