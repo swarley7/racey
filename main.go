@@ -152,7 +152,7 @@ func applyHeaders(req *http.Request, headers http.Header) {
 }
 
 func main() {
-	var Url, headers, requestFile, method string
+	var Url, headers, requestFile, method, logFile string
 	var count int
 	var delay int64
 	var debug, prettify bool
@@ -165,8 +165,60 @@ func main() {
 	flag.Int64Var(&delay, "delay", 1000, "Delay before sending final frames")
 	flag.BoolVar(&debug, "debug", false, "Enable http2 debugging, log TLS keys for interception")
 	flag.BoolVar(&prettify, "prettify", true, "Prettify the output of HTTP2 responses")
+	flag.StringVar(&logFile, "log", "", "Log file path for full untruncated response analysis")
 
 	flag.Parse()
+
+	// Setup log file if specified
+	var logWriter *os.File
+	if logFile != "" {
+		var err error
+		logWriter, err = os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("Failed to open log file: %v", err)
+		}
+		defer logWriter.Close()
+		fmt.Fprintf(logWriter, "\n%s\n", strings.Repeat("=", 80))
+		fmt.Fprintf(logWriter, "RACEY LOG - %s\n", time.Now().Format(time.RFC3339))
+		fmt.Fprintf(logWriter, "%s\n", strings.Repeat("=", 80))
+		fmt.Fprintf(logWriter, "\nINPUT PARAMETERS:\n")
+		fmt.Fprintf(logWriter, "  URL: %s\n", Url)
+		fmt.Fprintf(logWriter, "  Method: %s\n", method)
+		fmt.Fprintf(logWriter, "  Count: %d\n", count)
+		fmt.Fprintf(logWriter, "  Delay: %d ms\n", delay)
+		if requestFile != "" {
+			fmt.Fprintf(logWriter, "  Request File: %s\n", requestFile)
+			// Include the raw request file contents
+			if reqFileContents, err := os.ReadFile(requestFile); err == nil {
+				fmt.Fprintf(logWriter, "\nRAW REQUEST FILE CONTENTS:\n")
+				fmt.Fprintf(logWriter, "%s\n", strings.Repeat("-", 40))
+				fmt.Fprintf(logWriter, "%s\n", string(reqFileContents))
+				fmt.Fprintf(logWriter, "%s\n", strings.Repeat("-", 40))
+			}
+		}
+		if headers != "" {
+			fmt.Fprintf(logWriter, "  Custom Headers:\n")
+			for _, line := range strings.Split(headers, "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					fmt.Fprintf(logWriter, "    %s\n", line)
+				}
+			}
+		}
+		fmt.Fprintf(logWriter, "\nCOMMAND LINE (for repeatability):\n")
+		fmt.Fprintf(logWriter, "  go run main.go -url %q -method %s -count %d -delay %d",
+			Url, method, count, delay)
+		if requestFile != "" {
+			fmt.Fprintf(logWriter, " -request %q", requestFile)
+		}
+		if headers != "" {
+			fmt.Fprintf(logWriter, " -headers %q", headers)
+		}
+		if debug {
+			fmt.Fprintf(logWriter, " -debug")
+		}
+		fmt.Fprintf(logWriter, "\n")
+	}
 
 	//Wrap this in a method and loop
 	/* here*/
@@ -278,7 +330,7 @@ func main() {
 		log.Printf("Finished with error: %v", res.err)
 	} else {
 		log.Printf("Completed successfully")
-		analyzeResponses(res.responses)
+		analyzeResponses(res.responses, logWriter)
 	}
 }
 
@@ -469,17 +521,33 @@ func (app *request) onNewHeaderField(f hpack.HeaderField) {
 }
 
 // analyzeResponses compares all responses and reports variations
-func analyzeResponses(responses map[uint32]*Response) {
+// If logWriter is provided, writes full untruncated output to it
+func analyzeResponses(responses map[uint32]*Response, logWriter *os.File) {
+	// Helper to write to both stdout and log file
+	output := func(format string, args ...interface{}) {
+		fmt.Printf(format, args...)
+		if logWriter != nil {
+			fmt.Fprintf(logWriter, format, args...)
+		}
+	}
+
+	// Helper to write only to log file (for full untruncated data)
+	logOnly := func(format string, args ...interface{}) {
+		if logWriter != nil {
+			fmt.Fprintf(logWriter, format, args...)
+		}
+	}
+
 	if len(responses) == 0 {
-		fmt.Println("\n" + strings.Repeat("=", 60))
-		fmt.Println("NO RESPONSES RECEIVED")
-		fmt.Println(strings.Repeat("=", 60))
+		output("\n" + strings.Repeat("=", 60) + "\n")
+		output("NO RESPONSES RECEIVED\n")
+		output(strings.Repeat("=", 60) + "\n")
 		return
 	}
 
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("RESPONSE ANALYSIS")
-	fmt.Println(strings.Repeat("=", 60))
+	output("\n" + strings.Repeat("=", 60) + "\n")
+	output("RESPONSE ANALYSIS\n")
+	output(strings.Repeat("=", 60) + "\n")
 
 	// Group responses by status code
 	statusGroups := make(map[string][]uint32)
@@ -517,15 +585,15 @@ func analyzeResponses(responses map[uint32]*Response) {
 	}
 
 	// Report status code distribution
-	fmt.Printf("\n📊 Status Code Distribution:\n")
+	output("\n📊 Status Code Distribution:\n")
 	for status, streams := range statusGroups {
-		fmt.Printf("   [%s] × %d (streams: %v)\n", status, len(streams), streams)
+		output("   [%s] × %d (streams: %v)\n", status, len(streams), streams)
 	}
 
 	// Report body length distribution
-	fmt.Printf("\n📏 Response Length Distribution:\n")
+	output("\n📏 Response Length Distribution:\n")
 	for length, streams := range lengthGroups {
-		fmt.Printf("   [%d bytes] × %d (streams: %v)\n", length, len(streams), streams)
+		output("   [%d bytes] × %d (streams: %v)\n", length, len(streams), streams)
 	}
 
 	// Find headers that vary
@@ -537,50 +605,62 @@ func analyzeResponses(responses map[uint32]*Response) {
 	}
 
 	// Report header variations
+	totalResponses := len(responses)
 	if len(varyingHeaders) > 0 {
-		fmt.Printf("\n🔀 Varying Headers:\n")
+		output("\n🔀 Varying Headers:\n")
 		for headerName, values := range varyingHeaders {
-			fmt.Printf("   %s:\n", headerName)
+			// Count total streams that have this header
+			streamsWithHeader := 0
+			for _, streams := range values {
+				streamsWithHeader += len(streams)
+			}
+			uniqueValues := len(values)
+			output("   %s (%d unique in %d/%d responses):\n", headerName, uniqueValues, streamsWithHeader, totalResponses)
 			for value, streams := range values {
+				// Truncated for stdout
 				displayValue := value
 				if len(displayValue) > 60 {
 					displayValue = displayValue[:60] + "..."
 				}
 				fmt.Printf("      [%s] × %d (streams: %v)\n", displayValue, len(streams), streams)
+				// Full value for log file
+				if logWriter != nil {
+					fmt.Fprintf(logWriter, "      [%s] × %d (streams: %v)\n", value, len(streams), streams)
+				}
 			}
 		}
 	} else {
-		fmt.Printf("\n🔒 Headers: All identical across responses\n")
+		output("\n🔒 Headers: All identical across responses\n")
 	}
 
 	// Determine if responses vary
-	fmt.Println("\n" + strings.Repeat("-", 60))
+	output("\n" + strings.Repeat("-", 60) + "\n")
 
 	statusVaries := len(statusGroups) > 1
 	bodyVaries := len(bodyGroups) > 1
 	headersVary := len(varyingHeaders) > 0
 
 	if !statusVaries && !bodyVaries && !headersVary {
-		fmt.Println("✅ ALL RESPONSES IDENTICAL")
-		fmt.Printf("   Status: %s | Body Length: %d bytes\n",
+		output("✅ ALL RESPONSES IDENTICAL\n")
+		output("   Status: %s | Body Length: %d bytes\n",
 			responses[getFirstKey(responses)].Status,
 			len(responses[getFirstKey(responses)].Body))
 	} else {
-		fmt.Println("⚠️  RESPONSES VARY!")
+		output("⚠️  RESPONSES VARY!\n")
 
 		if statusVaries {
-			fmt.Println("   ↳ Status codes differ")
+			output("   ↳ Status codes differ\n")
 		}
 		if headersVary {
-			fmt.Printf("   ↳ %d header(s) differ: %s\n", len(varyingHeaders), getHeaderNames(varyingHeaders))
+			output("   ↳ %d header(s) differ: %s\n", len(varyingHeaders), getHeaderNames(varyingHeaders))
 		}
 		if bodyVaries {
-			fmt.Println("   ↳ Response bodies differ")
-			fmt.Printf("   ↳ %d unique response(s) detected\n", len(bodyGroups))
+			output("   ↳ Response bodies differ\n")
+			output("   ↳ %d unique response(s) detected\n", len(bodyGroups))
 		}
 
 		// Show unique responses
-		fmt.Println("\n📝 Unique Responses:")
+		output("\n📝 Unique Responses:\n")
 		shown := make(map[string]bool)
 		i := 1
 		for streamID, resp := range responses {
@@ -590,38 +670,69 @@ func analyzeResponses(responses map[uint32]*Response) {
 			}
 			shown[bodyKey] = true
 
-			fmt.Printf("\n   Response #%d (Stream %d):\n", i, streamID)
-			fmt.Printf("   Status: %s\n", resp.Status)
+			output("\n   Response #%d (Stream %d):\n", i, streamID)
+			output("   Status: %s\n", resp.Status)
 
 			// Show varying headers for this response
 			if headersVary {
-				fmt.Printf("   Varying Headers:\n")
+				output("   Varying Headers:\n")
 				for headerName := range varyingHeaders {
 					if val, ok := resp.Headers[headerName]; ok {
+						// Truncated for stdout
 						displayVal := val
 						if len(displayVal) > 50 {
 							displayVal = displayVal[:50] + "..."
 						}
 						fmt.Printf("      %s: %s\n", headerName, displayVal)
+						// Full value for log file
+						if logWriter != nil {
+							fmt.Fprintf(logWriter, "      %s: %s\n", headerName, val)
+						}
 					}
 				}
 			}
 
-			fmt.Printf("   Body Length: %d bytes\n", len(resp.Body))
+			output("   Body Length: %d bytes\n", len(resp.Body))
 
-			// Show truncated body preview
+			// Show truncated body preview for stdout
 			bodyPreview := string(resp.Body)
 			if len(bodyPreview) > 200 {
-				bodyPreview = bodyPreview[:200] + "..."
-			}
-			if bodyPreview != "" {
+				fmt.Printf("   Body Preview:\n   %s...\n", strings.ReplaceAll(bodyPreview[:200], "\n", "\n   "))
+			} else if bodyPreview != "" {
 				fmt.Printf("   Body Preview:\n   %s\n", strings.ReplaceAll(bodyPreview, "\n", "\n   "))
 			}
+
+			// Full body for log file
+			if logWriter != nil {
+				fmt.Fprintf(logWriter, "   Full Body:\n   %s\n", strings.ReplaceAll(string(resp.Body), "\n", "\n   "))
+			}
+
 			i++
 		}
 	}
 
-	fmt.Println("\n" + strings.Repeat("=", 60))
+	output("\n" + strings.Repeat("=", 60) + "\n")
+
+	// Write full response details to log file
+	if logWriter != nil {
+		logOnly("\n" + strings.Repeat("=", 80) + "\n")
+		logOnly("FULL RESPONSE DETAILS\n")
+		logOnly(strings.Repeat("=", 80) + "\n")
+
+		for streamID, resp := range responses {
+			logOnly("\n--- Stream %d ---\n", streamID)
+			logOnly("Status: %s\n", resp.Status)
+			if resp.Error != "" {
+				logOnly("Error: %s\n", resp.Error)
+			}
+			logOnly("\nHeaders:\n")
+			for name, value := range resp.Headers {
+				logOnly("   %s: %s\n", name, value)
+			}
+			logOnly("\nBody (%d bytes):\n%s\n", len(resp.Body), string(resp.Body))
+			logOnly(strings.Repeat("-", 40) + "\n")
+		}
+	}
 }
 
 func getFirstKey(m map[uint32]*Response) uint32 {
